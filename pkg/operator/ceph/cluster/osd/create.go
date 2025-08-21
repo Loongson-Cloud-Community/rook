@@ -18,11 +18,13 @@ package osd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	kms "github.com/rook/rook/pkg/daemon/ceph/osd/kms"
 	osdconfig "github.com/rook/rook/pkg/operator/ceph/cluster/osd/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	v1 "k8s.io/api/core/v1"
@@ -32,9 +34,9 @@ import (
 type createConfig struct {
 	cluster                  *Cluster
 	provisionConfig          *provisionConfig
-	awaitingStatusConfigMaps sets.String    // These status configmaps were created for OSD prepare jobs
-	finishedStatusConfigMaps sets.String    // Status configmaps are added here as provisioning is completed for them
-	deployments              *existenceList // these OSDs have existing deployments
+	awaitingStatusConfigMaps sets.Set[string] // These status configmaps were created for OSD prepare jobs
+	finishedStatusConfigMaps sets.Set[string] // Status configmaps are added here as provisioning is completed for them
+	deployments              *existenceList   // these OSDs have existing deployments
 }
 
 // allow overriding these functions for unit tests
@@ -47,17 +49,17 @@ var (
 
 func (c *Cluster) newCreateConfig(
 	provisionConfig *provisionConfig,
-	awaitingStatusConfigMaps sets.String,
+	awaitingStatusConfigMaps sets.Set[string],
 	deployments *existenceList,
 ) *createConfig {
 	if awaitingStatusConfigMaps == nil {
-		awaitingStatusConfigMaps = sets.NewString()
+		awaitingStatusConfigMaps = sets.New[string]()
 	}
 	return &createConfig{
 		c,
 		provisionConfig,
 		awaitingStatusConfigMaps,
-		sets.NewString(),
+		sets.New[string](),
 		deployments,
 	}
 }
@@ -87,21 +89,27 @@ func (c *createConfig) createNewOSDsFromStatus(
 		return
 	}
 
-	for _, osd := range status.OSDs {
+	for i, osd := range status.OSDs {
 		if c.deployments.Exists(osd.ID) {
 			// This OSD will be handled by the updater
 			logger.Debugf("not creating deployment for OSD %d which already exists", osd.ID)
 			continue
 		}
+
+		// osd prepare jobs don't generate cephx status info for OSDs. since this is a new OSD
+		// deployment, generate a first-deploy cephx status
+		status.OSDs[i].CephxStatus = keyring.UpdatedCephxStatus(false, c.cluster.spec.Security.CephX.Daemon,
+			c.cluster.clusterInfo.CephVersion, keyring.UninitializedCephxStatus())
+
 		if status.PvcBackedOSD {
 			logger.Infof("creating OSD %d on PVC %q", osd.ID, nodeOrPVCName)
-			err := createDaemonOnPVCFunc(c.cluster, osd, nodeOrPVCName, c.provisionConfig)
+			err := createDaemonOnPVCFunc(c.cluster, &status.OSDs[i], nodeOrPVCName, c.provisionConfig)
 			if err != nil {
 				errs.addError("%v", errors.Wrapf(err, "failed to create OSD %d on PVC %q", osd.ID, nodeOrPVCName))
 			}
 		} else {
 			logger.Infof("creating OSD %d on node %q", osd.ID, nodeOrPVCName)
-			err := createDaemonOnNodeFunc(c.cluster, osd, nodeOrPVCName, c.provisionConfig)
+			err := createDaemonOnNodeFunc(c.cluster, &status.OSDs[i], nodeOrPVCName, c.provisionConfig)
 			if err != nil {
 				errs.addError("%v", errors.Wrapf(err, "failed to create OSD %d on node %q", osd.ID, nodeOrPVCName))
 			}
@@ -122,23 +130,23 @@ func (c *createConfig) doneWithStatus(nodeOrPVCName string) {
 //
 // Creation of prepare jobs is most directly related to creating new OSDs. And we want to keep all
 // usage of awaitingStatusConfigMaps in this file.
-func (c *Cluster) startProvisioningOverPVCs(config *provisionConfig, errs *provisionErrors) (sets.String, error) {
+func (c *Cluster) startProvisioningOverPVCs(config *provisionConfig, errs *provisionErrors) (sets.Set[string], error) {
 	// Parsing storageClassDeviceSets and parsing it to volume sources
 	c.prepareStorageClassDeviceSets(errs)
 
 	// no valid VolumeSource is ready to run an osd
 	if len(c.deviceSets) == 0 {
 		logger.Info("no storageClassDeviceSets defined to configure OSDs on PVCs")
-		return sets.NewString(), nil
+		return sets.New[string](), nil
 	}
 
 	existingDeployments, err := c.getExistingOSDDeploymentsOnPVCs()
 	if err != nil {
 		errs.addError("failed to provision OSDs on PVCs. failed to query existing OSD deployments on PVCs. %v", err)
-		return sets.NewString(), nil
+		return sets.New[string](), nil
 	}
 
-	awaitingStatusConfigMaps := sets.NewString()
+	awaitingStatusConfigMaps := sets.New[string]()
 	for _, volume := range c.deviceSets {
 		if c.clusterInfo.Context.Err() != nil {
 			return awaitingStatusConfigMaps, c.clusterInfo.Context.Err()
@@ -180,17 +188,29 @@ func (c *Cluster) startProvisioningOverPVCs(config *provisionConfig, errs *provi
 
 		// Skip OSD prepare if deployment already exists for the PVC
 		// Also skip the encryption work part to avoid overriding the existing encryption key
+		skipPreparePod := false
 		if existingDeployments.Has(dataSource.ClaimName) {
+			skipPreparePod = true
+		}
+
+		// Allow updating OSD prepare pod if the OSD needs migration
+		if c.migrateOSD != nil {
+			if strings.Contains(c.migrateOSD.BlockPath, dataSource.ClaimName) {
+				logger.Infof("updating OSD prepare pod to replace OSD.%d", c.migrateOSD.ID)
+				skipPreparePod = false
+			}
+		}
+
+		if skipPreparePod {
 			logger.Infof("skipping OSD prepare job creation for PVC %q because OSD daemon using the PVC already exists", osdProps.crushHostname)
 			continue
 		}
 
 		if osdProps.encrypted {
 			// create encryption Kubernetes Secret if the PVC is encrypted
-			key, err := generateDmCryptKey()
+			key, err := GenerateDmCryptKey()
 			if err != nil {
-				errMsg := fmt.Sprintf("failed to generate dmcrypt key for osd claim %q. %v", osdProps.pvc.ClaimName, err)
-				errs.addError(errMsg)
+				errs.addError("failed to generate dmcrypt key for osd claim %q. %v", osdProps.pvc.ClaimName, err)
 				continue
 			}
 
@@ -202,8 +222,7 @@ func (c *Cluster) startProvisioningOverPVCs(config *provisionConfig, errs *provi
 			if c.spec.Security.KeyManagementService.IsTokenAuthEnabled() && c.spec.Security.KeyManagementService.IsVaultKMS() {
 				err := kms.SetTokenToEnvVar(c.clusterInfo.Context, c.context, c.spec.Security.KeyManagementService.TokenSecretName, kmsConfig.Provider, c.clusterInfo.Namespace)
 				if err != nil {
-					errMsg := fmt.Sprintf("failed to fetch kms token secret %q. %v", c.spec.Security.KeyManagementService.TokenSecretName, err)
-					errs.addError(errMsg)
+					errs.addError("failed to fetch kms token secret %q. %v", c.spec.Security.KeyManagementService.TokenSecretName, err)
 					continue
 				}
 			}
@@ -213,8 +232,7 @@ func (c *Cluster) startProvisioningOverPVCs(config *provisionConfig, errs *provi
 			// no risk of overwriting an existing key.
 			err = kmsConfig.PutSecret(osdProps.pvc.ClaimName, key)
 			if err != nil {
-				errMsg := fmt.Sprintf("failed to store secret. %v", err)
-				errs.addError(errMsg)
+				errs.addError("failed to store secret. %v", err)
 				continue
 			}
 		}
@@ -244,10 +262,10 @@ func (c *Cluster) startProvisioningOverPVCs(config *provisionConfig, errs *provi
 //
 // Creation of prepare jobs is most directly related to creating new OSDs. And we want to keep all
 // usage of awaitingStatusConfigMaps in this file.
-func (c *Cluster) startProvisioningOverNodes(config *provisionConfig, errs *provisionErrors) (sets.String, error) {
+func (c *Cluster) startProvisioningOverNodes(config *provisionConfig, errs *provisionErrors) (sets.Set[string], error) {
 	if !c.spec.Storage.UseAllNodes && len(c.spec.Storage.Nodes) == 0 {
 		logger.Info("no nodes are defined for configuring OSDs on raw devices")
-		return sets.NewString(), nil
+		return sets.New[string](), nil
 	}
 
 	if c.spec.Storage.UseAllNodes {
@@ -259,7 +277,7 @@ func (c *Cluster) startProvisioningOverNodes(config *provisionConfig, errs *prov
 		hostnameMap, err := k8sutil.GetNodeHostNames(c.clusterInfo.Context, c.context.Clientset)
 		if err != nil {
 			errs.addError("failed to provision OSDs on nodes. failed to get node hostnames. %v", err)
-			return sets.NewString(), nil
+			return sets.New[string](), nil
 		}
 		c.spec.Storage.Nodes = nil
 		for _, hostname := range hostnameMap {
@@ -281,15 +299,15 @@ func (c *Cluster) startProvisioningOverNodes(config *provisionConfig, errs *prov
 	// no valid node is ready to run an osd
 	if len(validNodes) == 0 {
 		logger.Warningf("no valid nodes available to run osds on nodes in namespace %q", c.clusterInfo.Namespace)
-		return sets.NewString(), nil
+		return sets.New[string](), nil
 	}
 
 	if len(c.spec.DataDirHostPath) == 0 {
 		errs.addError("failed to provision OSDs on nodes. user has specified valid nodes for storage, but dataDirHostPath is empty. user must set CephCluster dataDirHostPath")
-		return sets.NewString(), nil
+		return sets.New[string](), nil
 	}
 
-	awaitingStatusConfigMaps := sets.NewString()
+	awaitingStatusConfigMaps := sets.New[string]()
 	for _, node := range c.ValidStorage.Nodes {
 		if c.clusterInfo.Context.Err() != nil {
 			return awaitingStatusConfigMaps, c.clusterInfo.Context.Err()
@@ -358,7 +376,7 @@ func (c *Cluster) runPrepareJob(osdProps *osdProperties, config *provisionConfig
 	return nil
 }
 
-func createDaemonOnPVC(c *Cluster, osd OSDInfo, pvcName string, config *provisionConfig) error {
+func createDaemonOnPVC(c *Cluster, osd *OSDInfo, pvcName string, config *provisionConfig) error {
 	d, err := deploymentOnPVC(c, osd, pvcName, config)
 	if err != nil {
 		return err
@@ -368,10 +386,27 @@ func createDaemonOnPVC(c *Cluster, osd OSDInfo, pvcName string, config *provisio
 	updateConditionFunc(c.clusterInfo.Context, c.context, c.clusterInfo.NamespacedName(), k8sutil.ObservedGenerationNotAvailable, cephv1.ConditionProgressing, v1.ConditionTrue, cephv1.ClusterProgressingReason, message)
 
 	_, err = k8sutil.CreateDeployment(c.clusterInfo.Context, c.context.Clientset, d)
-	return errors.Wrapf(err, "failed to create deployment for OSD %d on PVC %q", osd.ID, pvcName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create deployment for OSD %d on PVC %q", osd.ID, pvcName)
+	}
+
+	if c.spec.Network.MultiClusterService.Enabled {
+		osd.ExportService = true
+		updatedDeployment, err := deploymentOnPVC(c, osd, pvcName, config)
+		if err != nil {
+			return errors.Wrapf(err, "failed to update external IP in deployment for OSD %d on PVC %q", osd.ID, pvcName)
+		}
+
+		_, err = k8sutil.CreateOrUpdateDeployment(c.clusterInfo.Context, c.context.Clientset, updatedDeployment)
+		if err != nil {
+			return errors.Wrapf(err, "failed to update osd %d deployment args with external IP", osd.ID)
+		}
+	}
+
+	return nil
 }
 
-func createDaemonOnNode(c *Cluster, osd OSDInfo, nodeName string, config *provisionConfig) error {
+func createDaemonOnNode(c *Cluster, osd *OSDInfo, nodeName string, config *provisionConfig) error {
 	d, err := deploymentOnNode(c, osd, nodeName, config)
 	if err != nil {
 		return err
@@ -381,5 +416,22 @@ func createDaemonOnNode(c *Cluster, osd OSDInfo, nodeName string, config *provis
 	updateConditionFunc(c.clusterInfo.Context, c.context, c.clusterInfo.NamespacedName(), k8sutil.ObservedGenerationNotAvailable, cephv1.ConditionProgressing, v1.ConditionTrue, cephv1.ClusterProgressingReason, message)
 
 	_, err = k8sutil.CreateDeployment(c.clusterInfo.Context, c.context.Clientset, d)
-	return errors.Wrapf(err, "failed to create deployment for OSD %d on node %q", osd.ID, nodeName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create deployment for OSD %d on node %q", osd.ID, nodeName)
+	}
+
+	if c.spec.Network.MultiClusterService.Enabled {
+		osd.ExportService = true
+		updatedDeployment, err := deploymentOnNode(c, osd, nodeName, config)
+		if err != nil {
+			return errors.Wrapf(err, "failed to update external IP in deployment for OSD %d on node %q", osd.ID, nodeName)
+		}
+
+		_, err = k8sutil.CreateOrUpdateDeployment(c.clusterInfo.Context, c.context.Clientset, updatedDeployment)
+		if err != nil {
+			return errors.Wrapf(err, "failed to update osd %d deployment args with external IP", osd.ID)
+		}
+	}
+
+	return nil
 }

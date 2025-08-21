@@ -239,9 +239,9 @@ var fakeMultiPeerCephBlockPool = cephv1.CephBlockPool{
 }
 
 func saveMockDataInTempFile(data, filePattern string) error {
-	matches, _ := filepath.Glob(fmt.Sprintf("/tmp/%s*", filePattern))
+	matches, _ := filepath.Glob(fmt.Sprintf("%s/%s*", os.TempDir(), filePattern))
 	for _, m := range matches {
-		file, err := os.OpenFile(m, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		file, err := os.OpenFile(m, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return fmt.Errorf("failed to open file %q. %v", m, err)
 		}
@@ -260,25 +260,26 @@ var mockExecutor = &exectest.MockExecutor{
 		logger.Infof("Command: %s %v", command, args)
 		// Fake pool details for "rook-ceph-primary" cluster
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[6], ns) {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
 				return `{"pool_id": 1}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
 				return `{"pool_id": 2}`, nil
 			}
-
 		}
 		return "", nil
 	},
 	MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[5], "peer1") {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
 				err := saveMockDataInTempFile(`{"pool_id": 2}`, peerPoolTempFile)
 				if err != nil {
 					return "", err
 				}
 				return `{"pool_id": 2}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
 				err := saveMockDataInTempFile(`{"pool_id": 3}`, peerPoolTempFile)
 				if err != nil {
 					return "", err
@@ -287,13 +288,14 @@ var mockExecutor = &exectest.MockExecutor{
 			}
 		}
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[5], "peer2") {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
 				err := saveMockDataInTempFile(`{"pool_id": 3}`, peerPoolTempFile)
 				if err != nil {
 					return "", err
 				}
 				return `{"pool_id": 3}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
 				err := saveMockDataInTempFile(`{"pool_id": 4}`, peerPoolTempFile)
 				if err != nil {
 					return "", err
@@ -302,13 +304,13 @@ var mockExecutor = &exectest.MockExecutor{
 			}
 		}
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[5], "peer3") {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
 				err := saveMockDataInTempFile(`{"pool_id": 4}`, peerPoolTempFile)
 				if err != nil {
 					return "", err
 				}
-				return `{"pool_id": 4}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
 				err := saveMockDataInTempFile(`{"pool_id": 5}`, peerPoolTempFile)
 				if err != nil {
 					return "", err
@@ -331,7 +333,7 @@ func TestSinglePeerMappings(t *testing.T) {
 	_, err := fakeContext.Clientset.CoreV1().Secrets(ns).Create(context.TODO(), &peer1Secret, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
-	//expected: &[{ClusterIDMapping:{peer1:rook-ceph-primary}. RBDPoolIDMapping:[{2:1}]}]
+	// expected: &[{ClusterIDMapping:{peer1:rook-ceph-primary}. RBDPoolIDMapping:[{2:1}]}]
 	actualMappings, err := getClusterPoolIDMap(
 		fakeContext,
 		clusterInfo,
@@ -451,9 +453,9 @@ func TestCreateOrUpdateConfig(t *testing.T) {
 
 	err = CreateOrUpdateConfig(context.TODO(), fakeContext, actualMappings)
 	assert.NoError(t, err)
-	//validateConfig(t, fakeContext, actualMappings)
+	// validateConfig(t, fakeContext, actualMappings)
 
-	//Update existing mapping config
+	// Update existing mapping config
 	mappings := *actualMappings
 	mappings = append(mappings, PeerIDMapping{
 		ClusterIDMapping: map[string]string{"peer2": ns},

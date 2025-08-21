@@ -29,10 +29,10 @@ func TestEnvName() string {
 
 // TestRetryNumber  get the max retry. Example, for OpenShift it's 40.
 func TestRetryNumber() int {
-	count := GetEnvVarWithDefault("RETRY_MAX", "45")
+	count := GetEnvVarWithDefault("RETRY_MAX", "55")
 	number, err := strconv.Atoi(count)
 	if err != nil {
-		panic(fmt.Errorf("Error when converting to numeric value %v", err))
+		panic(fmt.Errorf("error when converting to numeric value %v", err))
 	}
 	return number
 }

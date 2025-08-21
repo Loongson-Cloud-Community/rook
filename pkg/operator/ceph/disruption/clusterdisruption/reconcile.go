@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/disruption/controllerconfig"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 )
@@ -56,12 +57,11 @@ var (
 // ReconcileClusterDisruption reconciles ReplicaSets
 type ReconcileClusterDisruption struct {
 	// client can be used to retrieve objects from the APIServer.
-	scheme               *runtime.Scheme
-	client               client.Client
-	context              *controllerconfig.Context
-	clusterMap           *ClusterMap
-	maintenanceTimeout   time.Duration
-	pgHealthCheckTimeout time.Duration
+	scheme             *runtime.Scheme
+	client             client.Client
+	context            *controllerconfig.Context
+	clusterMap         *ClusterMap
+	maintenanceTimeout time.Duration
 }
 
 // Reconcile reconciles a node and ensures that it has a drain-detection deployment
@@ -69,6 +69,7 @@ type ReconcileClusterDisruption struct {
 // The Controller will requeue the Request to be processed again if an error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileClusterDisruption) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// wrapping reconcile because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	result, err := r.reconcile(request)
 	if err != nil {
@@ -135,8 +136,6 @@ func (r *ReconcileClusterDisruption) reconcile(request reconcile.Request) (recon
 		logger.Debugf("Using default maintenance timeout: %v", r.maintenanceTimeout)
 	}
 
-	r.pgHealthCheckTimeout = cephCluster.Spec.DisruptionManagement.PGHealthCheckTimeout * time.Minute
-
 	//  reconcile the pools and get the failure domain
 	cephObjectStoreList, cephFilesystemList, poolFailureDomain, poolCount, err := r.processPools(request)
 	if err != nil {
@@ -161,7 +160,7 @@ func (r *ReconcileClusterDisruption) reconcile(request reconcile.Request) (recon
 	}
 
 	// get a list of all the failure domains, failure domains with failed OSDs and failure domains with drained nodes
-	allFailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, err := r.getOSDFailureDomains(clusterInfo, request, poolFailureDomain)
+	allFailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, downOSDs, err := r.getOSDFailureDomains(clusterInfo, request, poolFailureDomain)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
@@ -172,8 +171,8 @@ func (r *ReconcileClusterDisruption) reconcile(request reconcile.Request) (recon
 		return reconcile.Result{}, err
 	}
 
-	activeNodeDrains := len(nodeDrainFailureDomains) > 0
-	return r.reconcilePDBsForOSDs(clusterInfo, request, pdbStateMap, poolFailureDomain, allFailureDomains, osdDownFailureDomains, activeNodeDrains)
+	pgHealthyRegex := cephCluster.Spec.DisruptionManagement.PGHealthyRegex
+	return r.reconcilePDBsForOSDs(clusterInfo, request, pdbStateMap, poolFailureDomain, allFailureDomains, osdDownFailureDomains, nodeDrainFailureDomains, downOSDs, pgHealthyRegex)
 }
 
 // ClusterMap maintains the association between namespace and clusername
@@ -190,7 +189,6 @@ func (c *ClusterMap) UpdateClusterMap(namespace string, cluster *cephv1.CephClus
 		c.clusterMap = make(map[string]*cephv1.CephCluster)
 	}
 	c.clusterMap[namespace] = cluster
-
 }
 
 // GetClusterInfo looks up the context for the current ceph cluster.

@@ -103,12 +103,11 @@ func SetFakeKubernetesVersion(clientset *fake.Clientset, semver string) {
 	if len(xyz) != 3 {
 		panic(fmt.Errorf("version not in 'vX.Y.Z' format: %s", semver))
 	}
-	fd.FakedServerVersion =
-		&version.Info{
-			Major:      xyz[0],
-			Minor:      xyz[1],
-			GitVersion: semver,
-		}
+	fd.FakedServerVersion = &version.Info{
+		Major:      xyz[0],
+		Minor:      xyz[1],
+		GitVersion: semver,
+	}
 }
 
 var (
@@ -141,6 +140,9 @@ func NewComplexClientset(t *testing.T) *fake.Clientset {
 		}
 		obj := createAction.GetObject()
 		objMeta, err := meta.Accessor(obj)
+		if err != nil {
+			panic(fmt.Errorf("failed to objMeta"))
+		}
 		resource := action.GetResource().Resource
 		name := objMeta.GetName()
 
@@ -296,4 +298,27 @@ func FakeReplicaSet(ns string) *appsv1.ReplicaSet {
 	}
 
 	return r
+}
+
+func FakeCustomisePodCreate(t *testing.T, clientset *fake.Clientset, name, ns string, label map[string]string) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "Deployment",
+				},
+			},
+			Labels: label,
+		},
+	}
+	err := clientset.Tracker().Create(podGVR, pod, ns)
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			t.Logf("pod %q is already created", pod.GetName())
+		}
+		panic(fmt.Errorf("failed to create Pod %q. %v", pod.Name, err))
+	}
+	t.Logf("job reactor: created pod %q ", pod.Name)
 }

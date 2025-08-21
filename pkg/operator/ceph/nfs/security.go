@@ -18,10 +18,8 @@ package nfs
 
 import (
 	"fmt"
-	"path/filepath"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"github.com/rook/rook/pkg/operator/k8sutil"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -61,7 +59,7 @@ func addSSSDConfigsToPod(r *ReconcileCephNFS, nfs *cephv1.CephNFS, pod *v1.PodSp
 	sidecarCfg := nfs.Spec.Security.SSSD.Sidecar
 	if sidecarCfg != nil {
 		logger.Debugf("configuring SSSD sidecar for CephNFS %q", nsName)
-		init, sidecar, vols, mounts := generateSssdSidecarResources(sidecarCfg)
+		init, sidecar, vols, mounts := generateSssdSidecarResources(nfs, sidecarCfg)
 
 		pod.InitContainers = append(pod.InitContainers, *init)
 		pod.Containers = append(pod.Containers, *sidecar)
@@ -72,12 +70,14 @@ func addSSSDConfigsToPod(r *ReconcileCephNFS, nfs *cephv1.CephNFS, pod *v1.PodSp
 }
 
 func addKerberosConfigsToPod(r *ReconcileCephNFS, nfs *cephv1.CephNFS, pod *v1.PodSpec) {
-	init, volume, ganeshaMount := generateKrbConfResources(r, nfs)
+	init, volume, ganeshaMounts := generateKrbConfResources(r, nfs)
 
 	pod.InitContainers = append(pod.InitContainers, *init)
 	pod.Volumes = append(pod.Volumes, *volume)
 	// assume the first container is the NFS-Ganesha container
-	pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, *ganeshaMount)
+	for _, m := range ganeshaMounts {
+		pod.Containers[0].VolumeMounts = append(pod.Containers[0].VolumeMounts, *m)
+	}
 
 	configVolSrc := nfs.Spec.Security.Kerberos.ConfigFiles.VolumeSource
 	if configVolSrc != nil {
@@ -96,7 +96,7 @@ func addKerberosConfigsToPod(r *ReconcileCephNFS, nfs *cephv1.CephNFS, pod *v1.P
 	}
 }
 
-func generateSssdSidecarResources(sidecarCfg *cephv1.SSSDSidecar) (
+func generateSssdSidecarResources(nfs *cephv1.CephNFS, sidecarCfg *cephv1.SSSDSidecar) (
 	init *v1.Container,
 	sidecar *v1.Container,
 	volumes []v1.Volume, // add these volumes to the pod
@@ -136,15 +136,43 @@ func generateSssdSidecarResources(sidecarCfg *cephv1.SSSDSidecar) (
 
 	volSource := sidecarCfg.SSSDConfigFile.VolumeSource
 	if volSource != nil {
-		vol, mount := sssdConfigVolAndMount(*volSource)
+		vol, mount := sssdConfigVolAndMount(*volSource.ToKubernetesVolumeSource())
 
 		volumes = append(volumes, vol)
 		sssdMounts = append(sssdMounts, mount)
 	}
 
-	genericVols, genericMounts := generateGenericFileVolsAndMounts(sidecarCfg.AdditionalFiles)
+	genericVols, genericMounts := sidecarCfg.AdditionalFiles.GenerateVolumesAndMounts("/etc/sssd/rook-additional/")
 	volumes = append(volumes, genericVols...)
 	sssdMounts = append(sssdMounts, genericMounts...)
+
+	// The volumes for krb5.conf and krb5.keytab are created separately
+	// for the nfs-ganesha container. We reuse it here.
+	if nfs.Spec.Security.Kerberos != nil {
+		krb5ConfVolName := "krb5-conf-d"
+		generatedKrbConfVolName := "generated-krb5-conf"
+
+		krb5ConfD := v1.VolumeMount{
+			Name:      krb5ConfVolName,
+			MountPath: "/etc/krb5.conf.rook/",
+		}
+		krbConfMount := v1.VolumeMount{
+			Name:      generatedKrbConfVolName,
+			MountPath: "/etc/krb5.conf",
+			SubPath:   "krb5.conf",
+		}
+		sssdMounts = append(sssdMounts, krb5ConfD, krbConfMount)
+
+		if nfs.Spec.Security.Kerberos.KeytabFile.VolumeSource != nil {
+			volName := "krb5-keytab"
+			keytabMount := v1.VolumeMount{
+				Name:      volName,
+				MountPath: "/etc/krb5.keytab",
+				SubPath:   "krb5.keytab",
+			}
+			sssdMounts = append(sssdMounts, keytabMount)
+		}
+	}
 
 	// the init container is needed to copy the starting content from the /var/lib/sss/pipes
 	// directory into the shared sockets dir so that SSSD has the content it needs to start up
@@ -187,9 +215,10 @@ ls --all --recursive /tmp/var/lib/sss/pipes`,
 func generateKrbConfResources(r *ReconcileCephNFS, nfs *cephv1.CephNFS) (
 	init *v1.Container,
 	volume *v1.Volume, // add these volumes to the pod
-	ganeshaMount *v1.VolumeMount, // add these volume mounts to the nfs-ganesha container
+	ganeshaMounts []*v1.VolumeMount, // add these volume mounts to the nfs-ganesha container
 ) {
 	generatedKrbConfVolName := "generated-krb5-conf"
+	kerberosDomainName := nfs.Spec.Security.Kerberos.DomainName
 
 	volume = &v1.Volume{
 		Name: generatedKrbConfVolName,
@@ -197,10 +226,28 @@ func generateKrbConfResources(r *ReconcileCephNFS, nfs *cephv1.CephNFS) (
 			EmptyDir: &v1.EmptyDirVolumeSource{},
 		},
 	}
-	ganeshaMount = &v1.VolumeMount{
+	krbConfMount := &v1.VolumeMount{
 		Name:      generatedKrbConfVolName,
 		MountPath: "/etc/krb5.conf",
 		SubPath:   "krb5.conf",
+	}
+	ganeshaMounts = append(ganeshaMounts, krbConfMount)
+
+	domainNameCommand := ""
+	domainName := nfs.Spec.Security.Kerberos.DomainName
+	if domainName != "" {
+		domainNameCommand = `
+cat << EOF > /tmp/etc/idmapd.conf
+[General]
+Domain = ` + kerberosDomainName + `
+EOF
+cat /etc/idmapd.conf`
+		idmapdConfMount := &v1.VolumeMount{
+			Name:      generatedKrbConfVolName,
+			MountPath: "/etc/idmapd.conf",
+			SubPath:   "idmapd.conf",
+		}
+		ganeshaMounts = append(ganeshaMounts, idmapdConfMount)
 	}
 
 	// the init container is needed to copy the starting content from the /var/lib/sss/pipes
@@ -216,7 +263,8 @@ default = STDERR
 
 includedir /etc/krb5.conf.rook/
 EOF
-cat /tmp/etc/krb5.conf`,
+cat /tmp/etc/krb5.conf
+` + domainNameCommand,
 		},
 		VolumeMounts: []v1.VolumeMount{
 			{Name: generatedKrbConfVolName, MountPath: "/tmp/etc"},
@@ -225,7 +273,7 @@ cat /tmp/etc/krb5.conf`,
 		Resources: nfs.Spec.Server.Resources,
 	}
 
-	return init, volume, ganeshaMount
+	return init, volume, ganeshaMounts
 }
 
 func sssdConfigVolAndMount(volSource v1.VolumeSource) (v1.Volume, v1.VolumeMount) {
@@ -241,26 +289,6 @@ func sssdConfigVolAndMount(volSource v1.VolumeSource) (v1.Volume, v1.VolumeMount
 	}
 
 	return vol, mount
-}
-
-func generateGenericFileVolsAndMounts(additionalFiles []cephv1.SSSDSidecarAdditionalFile) ([]v1.Volume, []v1.VolumeMount) {
-	vols := []v1.Volume{}
-	mounts := []v1.VolumeMount{}
-
-	for _, additionalFile := range additionalFiles {
-		mountPath := filepath.Join("/etc/sssd/rook-additional/", additionalFile.SubPath)
-		volName := k8sutil.ToValidDNSLabel(mountPath)
-		vols = append(vols, v1.Volume{
-			Name:         volName,
-			VolumeSource: *additionalFile.VolumeSource,
-		})
-		mounts = append(mounts, v1.VolumeMount{
-			Name:      volName,
-			MountPath: mountPath,
-		})
-	}
-
-	return vols, mounts
 }
 
 func generateSssdNsswitchConfResources(r *ReconcileCephNFS, nfs *cephv1.CephNFS) (*v1.Container, *v1.Volume, *v1.VolumeMount) {
@@ -288,8 +316,8 @@ func generateSssdNsswitchConfResources(r *ReconcileCephNFS, nfs *cephv1.CephNFS)
 			"bash", "-c",
 			`set -ex
 cat << EOF > /tmp/etc/nsswitch.conf
-passwd: sss
-group: sss
+passwd: files sss
+group: files sss
 netgroup: sss
 EOF
 chmod 444 /tmp/etc/nsswitch.conf
@@ -308,11 +336,11 @@ cat /tmp/etc/nsswitch.conf`,
 	return init, podVol, nfsGaneshaContainerMount
 }
 
-func kerberosConfigFilesVolAndMount(volSource v1.VolumeSource) (v1.Volume, v1.VolumeMount) {
+func kerberosConfigFilesVolAndMount(volSource cephv1.ConfigFileVolumeSource) (v1.Volume, v1.VolumeMount) {
 	volName := "krb5-conf-d"
 	vol := v1.Volume{
 		Name:         volName,
-		VolumeSource: volSource,
+		VolumeSource: *volSource.ToKubernetesVolumeSource(),
 	}
 	mount := v1.VolumeMount{
 		Name:      volName,
@@ -322,11 +350,11 @@ func kerberosConfigFilesVolAndMount(volSource v1.VolumeSource) (v1.Volume, v1.Vo
 	return vol, mount
 }
 
-func keytabVolAndMount(volSource v1.VolumeSource) (v1.Volume, v1.VolumeMount) {
+func keytabVolAndMount(volSource cephv1.ConfigFileVolumeSource) (v1.Volume, v1.VolumeMount) {
 	volName := "krb5-keytab"
 	vol := v1.Volume{
 		Name:         volName,
-		VolumeSource: volSource,
+		VolumeSource: *volSource.ToKubernetesVolumeSource(),
 	}
 	mount := v1.VolumeMount{
 		Name:      volName,

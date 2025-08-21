@@ -31,7 +31,6 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/reporting"
-	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -51,9 +50,6 @@ import (
 const (
 	controllerName = "ceph-nfs-controller"
 )
-
-// Version of Ceph where NFS default pool name changes to ".nfs"
-var cephNFSChangeVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 7}
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", controllerName)
 
@@ -104,6 +100,21 @@ func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerCont
 	}
 }
 
+func watchOwnedCoreObject[T client.Object](c controller.Controller, mgr manager.Manager, obj T) error {
+	return c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			obj,
+			handler.TypedEnqueueRequestForOwner[T](
+				mgr.GetScheme(),
+				mgr.GetRESTMapper(),
+				&cephv1.CephNFS{},
+			),
+			opcontroller.WatchPredicateForNonCRDObject[T](&cephv1.CephNFS{TypeMeta: controllerTypeMeta}, mgr.GetScheme()),
+		),
+	)
+}
+
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
@@ -113,17 +124,21 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	logger.Info("successfully started")
 
 	// Watch for changes on the cephNFS CRD object
-	err = c.Watch(&source.Kind{Type: &cephv1.CephNFS{TypeMeta: controllerTypeMeta}}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephNFS{TypeMeta: controllerTypeMeta},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephNFS]{},
+			opcontroller.WatchControllerPredicate[*cephv1.CephNFS](mgr.GetScheme()),
+		),
+	)
 	if err != nil {
 		return err
 	}
 
 	// Watch all other resources
 	for _, t := range objectsToWatch {
-		err = c.Watch(&source.Kind{Type: t}, &handler.EnqueueRequestForOwner{
-			IsController: true,
-			OwnerType:    &cephv1.CephNFS{},
-		}, opcontroller.WatchPredicateForNonCRDObject(&cephv1.CephNFS{TypeMeta: controllerTypeMeta}, mgr.GetScheme()))
+		err = watchOwnedCoreObject(c, mgr, t)
 		if err != nil {
 			return err
 		}
@@ -137,6 +152,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCephNFS) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, cephNFS, err := r.reconcile(request)
 
@@ -161,9 +177,13 @@ func (r *ReconcileCephNFS) reconcile(request reconcile.Request) (reconcile.Resul
 	observedGeneration := cephNFS.ObjectMeta.Generation
 
 	// Set a finalizer so we can do cleanup before the object goes away
-	err = opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephNFS)
+	generationUpdated, err := opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephNFS)
 	if err != nil {
 		return reconcile.Result{}, *cephNFS, errors.Wrap(err, "failed to add finalizer")
+	}
+	if generationUpdated {
+		logger.Infof("reconciling the nfs %q after adding finalizer", cephNFS.Name)
+		return reconcile.Result{}, *cephNFS, nil
 	}
 
 	// The CR was just created, initializing status fields
@@ -266,13 +286,7 @@ func (r *ReconcileCephNFS) reconcile(request reconcile.Request) (reconcile.Resul
 	}
 	r.clusterInfo.CephVersion = *runningCephVersion
 
-	// Pacific before 16.2.7: No customization, default pool name is nfs-ganesha
-	// Pacific after 16.2.7: No customization, default pool name is .nfs
-	if r.clusterInfo.CephVersion.IsAtLeast(cephNFSChangeVersion) {
-		cephNFS.Spec.RADOS.Pool = postNFSChangeDefaultPoolName
-	} else {
-		cephNFS.Spec.RADOS.Pool = preNFSChangeDefaultPoolName
-	}
+	cephNFS.Spec.RADOS.Pool = nfsDefaultPoolName
 	cephNFS.Spec.RADOS.Namespace = cephNFS.Name
 
 	// validate the store settings
@@ -301,7 +315,6 @@ func (r *ReconcileCephNFS) reconcile(request reconcile.Request) (reconcile.Resul
 	// Return and do not requeue
 	logger.Debug("done reconciling ceph nfs")
 	return reconcile.Result{}, *cephNFS, nil
-
 }
 
 func (r *ReconcileCephNFS) reconcileCreateCephNFS(cephNFS *cephv1.CephNFS) (reconcile.Result, error) {

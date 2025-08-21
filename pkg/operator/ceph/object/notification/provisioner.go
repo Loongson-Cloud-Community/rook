@@ -72,27 +72,25 @@ func newS3Agent(p provisioner) (*object.S3Agent, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get object context for CephObjectStore %v", p.objectStoreName)
 	}
-	// CephClusterSpec is needed for GetAdminOPSUserCredentials()
-	objContext.CephClusterSpec = *p.clusterSpec
 
 	adminOpsCtx, err := object.NewMultisiteAdminOpsContext(objContext, &objStore.Spec)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get admin Ops context for CephObjectStore %q", p.objectStoreName)
-
 	}
 	accessKey, secretKey, err := getUserCredentials(adminOpsCtx, p.opManagerContext, p.owner)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get owner credentials for %q", p.owner)
 	}
 	tlsCert := make([]byte, 0)
+	insecureTLS := false
 	if objStore.Spec.IsTLSEnabled() {
-		tlsCert, _, err = object.GetTlsCaCert(objContext, &objStore.Spec)
+		tlsCert, insecureTLS, err = object.GetTlsCaCert(objContext, &objStore.Spec)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to fetch TLS certificate for the object store")
 		}
 	}
 
-	return object.NewS3Agent(accessKey, secretKey, objContext.Endpoint, logger.LevelAt(capnslog.DEBUG), tlsCert)
+	return object.NewS3Agent(accessKey, secretKey, objContext.Endpoint, logger.LevelAt(capnslog.DEBUG), tlsCert, insecureTLS, nil)
 }
 
 // TODO: convert all rules without restrictions once the AWS SDK supports that

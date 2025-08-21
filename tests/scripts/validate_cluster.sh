@@ -20,14 +20,21 @@ set -xEe
 if [ -z "$DAEMON_TO_VALIDATE" ]; then
   DAEMON_TO_VALIDATE=all
 fi
-OSD_COUNT=$2
+# The second script arg is optional and depends on the daemon
+if [ "$DAEMON_TO_VALIDATE" == "rgw" ]; then
+  export OBJECT_STORE_NAME=$2
+else
+  export OSD_COUNT=$2
+  # default to the name of the object store from object-a.yaml
+  export OBJECT_STORE_NAME=store-a
+fi
 
 #############
 # FUNCTIONS #
 #############
-EXEC_COMMAND="kubectl -n rook-ceph exec $(kubectl get pod -l app=rook-ceph-tools -n rook-ceph -o jsonpath='{.items[*].metadata.name}') -- ceph --connect-timeout 3"
+EXEC_COMMAND="kubectl -n rook-ceph exec $(kubectl get pod -l app=rook-ceph-tools -n rook-ceph -o jsonpath='{.items[*].metadata.name}') -- ceph --connect-timeout 10"
 
-function wait_for_daemon () {
+function wait_for_daemon() {
   timeout=90
   daemon_to_test=$1
   while [ $timeout -ne 0 ]; do
@@ -55,12 +62,19 @@ function test_demo_mgr {
 
 function test_demo_osd {
   # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq \"$OSD_COUNT osds: $OSD_COUNT up.*, $OSD_COUNT in.*\"")
+  ret_val=$(wait_for_daemon "$EXEC_COMMAND -s | grep -sq \"$OSD_COUNT osds: $OSD_COUNT up.*, $OSD_COUNT in.*\"")
+  # debug info for an intermittent failure
+  echo "Return value = $ret_val"
+  return $ret_val
 }
 
 function test_demo_rgw {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'rgw:'")
+  timeout 360 bash -x <<-'EOF'
+    until [[ "$(kubectl -n rook-ceph get pods -l rgw=$OBJECT_STORE_NAME -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}')" == "True" ]]; do
+      echo "waiting for rgw pods to be ready"
+      sleep 5
+    done
+EOF
 }
 
 function test_demo_mds {
@@ -79,7 +93,7 @@ function test_demo_rbd_mirror {
 
 function test_demo_fs_mirror {
   # shellcheck disable=SC2046
-    return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'cephfs-mirror:'")
+  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'cephfs-mirror:'")
 }
 
 function test_demo_pool {
@@ -89,25 +103,11 @@ function test_demo_pool {
 
 function test_csi {
   timeout 360 bash -x <<-'EOF'
-    echo $IS_POD_NETWORK
-    echo $IS_MULTUS
-    if [ -z "$IS_POD_NETWORK" ]; then
-      until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^csi-)" -eq 6 ]]; do
-        echo "waiting for csi pods to be ready"
-        sleep 5
-      done
-    else
-      until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^csi-)" -eq 9 ]]; do
-        echo "waiting for csi pods to be ready with multus or pod networking"
-        sleep 5
-      done
-    fi
-    if [ -n "$IS_MULTUS" ]; then
-      echo "verifying csi holder interfaces (multus ones must be present)"
-      kubectl -n rook-ceph exec -t ds/csi-rbdplugin-holder-my-cluster -- grep net /proc/net/dev
-      kubectl -n rook-ceph exec -t ds/csi-cephfsplugin-holder-my-cluster -- grep net /proc/net/dev
-      kubectl -n rook-ceph exec -t ds/csi-nfsplugin-holder-my-cluster -- grep net /proc/net/dev
-    fi
+    until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c csi.)" -ge 7 ]]; do
+      echo "waiting for csi pods to be ready"
+      kubectl -n rook-ceph get pods | grep csi
+      sleep 5
+    done
 EOF
 }
 
@@ -118,13 +118,6 @@ function test_nfs {
       sleep 5
     done
 EOF
-}
-
-function test_multus_osd {
-  for i in $(seq 1 2); do
-    kubectl -n rook-ceph exec -t deploy/rook-ceph-osd-0 -c osd -- grep net"$i" /proc/net/dev
-    kubectl -n rook-ceph exec -t deploy/rook-ceph-osd-0 -c osd -- grep net"$i" /proc/net/dev
-  done
 }
 
 ########
@@ -141,7 +134,7 @@ else
   comma_to_space=${DAEMON_TO_VALIDATE//,/ }
 
   # transform to an array
-  IFS=" " read -r -a array <<< "$comma_to_space"
+  IFS=" " read -r -a array <<<"$comma_to_space"
 
   # sort and remove potential duplicate
   daemons_list=$(echo "${array[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
@@ -149,39 +142,35 @@ fi
 
 for daemon in $daemons_list; do
   case "$daemon" in
-    mon)
-      continue
-      ;;
-    mgr)
-      continue
-      ;;
-    osd)
-      test_demo_osd
-      ;;
-    osd_multus)
-      test_demo_osd
-      test_multus_osd
-      ;;
-    mds)
-      test_demo_mds
-      ;;
-    rgw)
-      test_demo_rgw
-      ;;
-    rbd_mirror)
-      test_demo_rbd_mirror
-      ;;
-    fs_mirror)
-      test_demo_fs_mirror
-      ;;
-    nfs)
-      test_nfs
-      ;;
-    *)
-      log "ERROR: unknown daemon to validate!"
-      log "Available daemon are: mon mgr osd mds rgw rbd_mirror fs_mirror"
-      exit 1
-      ;;
+  mon)
+    continue
+    ;;
+  mgr)
+    continue
+    ;;
+  osd)
+    test_demo_osd
+    ;;
+  mds)
+    test_demo_mds
+    ;;
+  rgw)
+    test_demo_rgw
+    ;;
+  rbd_mirror)
+    test_demo_rbd_mirror
+    ;;
+  fs_mirror)
+    test_demo_fs_mirror
+    ;;
+  nfs)
+    test_nfs
+    ;;
+  *)
+    log "ERROR: unknown daemon to validate!"
+    log "Available daemon are: mon mgr osd mds rgw rbd_mirror fs_mirror"
+    exit 1
+    ;;
   esac
 done
 

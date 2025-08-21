@@ -17,6 +17,7 @@ spec:
         {{ $key }}: "{{ $value }}"
         {{ end }}
     spec:
+      securityContext: {}
       serviceAccountName: rook-csi-nfs-plugin-sa
       hostNetwork: {{ .EnableCSIHostNetwork }}
       {{ if .PluginPriorityClassName }}
@@ -31,6 +32,9 @@ spec:
           # non-privileged sidecar containers cannot access unix domain socket
           # created by privileged CSI driver container.
           securityContext:
+            capabilities:
+              add: []
+              drop: ["ALL"]
             privileged: true
           image: {{ .RegistrarImage }}
           imagePullPolicy: {{ .ImagePullPolicy }}
@@ -54,6 +58,7 @@ spec:
             capabilities:
               add:
               - SYS_ADMIN
+              drop: ["ALL"]
             privileged: true
           args:
             - "--nodeid=$(NODE_ID)"
@@ -63,6 +68,11 @@ spec:
             - "--nodeserver=true"
             - "--drivername={{ .DriverNamePrefix }}nfs.csi.ceph.com"
             - "--pidlimit=-1"
+            {{ if .CSILogRotation }}
+            - "--logtostderr=false"
+            - "--alsologtostderr=true"
+            - "--log_file={{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}/csi-nfsplugin.log"
+            {{ end }}
           env:
           - name: NODE_ID
             valueFrom:
@@ -95,6 +105,10 @@ spec:
               mountPath: /tmp/csi/keys
             - name: host-run-mount
               mountPath: /run/mount
+            {{ if .CSILogRotation }}
+            - mountPath: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+              name: csi-log
+            {{ end }}
             {{ if .EnablePluginSelinuxHostMount }}
             -  name: etc-selinux
                mountPath: /etc/selinux
@@ -144,6 +158,15 @@ spec:
         - name: host-run-mount
           hostPath:
             path: /run/mount
+        {{ if .CSILogRotation }}
+        - name: csi-log
+          hostPath:
+            path: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+            type: DirectoryOrCreate
+        - name: csi-logs-logrotate
+          emptyDir:
+            type: DirectoryOrCreate
+        {{ end }}
         {{ if .EnablePluginSelinuxHostMount }}
         - name: etc-selinux
           hostPath:

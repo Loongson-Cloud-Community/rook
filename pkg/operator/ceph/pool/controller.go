@@ -21,10 +21,12 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/coreos/pkg/capnslog"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/util/dependents"
 	"github.com/rook/rook/pkg/util/exec"
 
 	"github.com/pkg/errors"
@@ -76,6 +78,7 @@ type ReconcileCephBlockPool struct {
 	blockPoolContexts map[string]*blockPoolHealth
 	opManagerContext  context.Context
 	recorder          record.EventRecorder
+	opConfig          opcontroller.OperatorConfig
 }
 
 type blockPoolHealth struct {
@@ -87,11 +90,11 @@ type blockPoolHealth struct {
 // Add creates a new CephBlockPool Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
-	return add(opManagerContext, mgr, newReconciler(mgr, context, opManagerContext))
+	return add(opManagerContext, mgr, newReconciler(mgr, context, opManagerContext, opConfig))
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) reconcile.Reconciler {
 	return &ReconcileCephBlockPool{
 		client:            mgr.GetClient(),
 		scheme:            mgr.GetScheme(),
@@ -99,6 +102,7 @@ func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerCont
 		blockPoolContexts: make(map[string]*blockPoolHealth),
 		opManagerContext:  opManagerContext,
 		recorder:          mgr.GetEventRecorderFor("rook-" + controllerName),
+		opConfig:          opConfig,
 	}
 }
 
@@ -111,20 +115,63 @@ func add(opManagerContext context.Context, mgr manager.Manager, r reconcile.Reco
 	logger.Info("successfully started")
 
 	// Watch for changes on the CephBlockPool CRD object
-	err = c.Watch(&source.Kind{Type: &cephv1.CephBlockPool{TypeMeta: controllerTypeMeta}}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephBlockPool{TypeMeta: controllerTypeMeta},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephBlockPool]{},
+			opcontroller.WatchControllerPredicate[*cephv1.CephBlockPool](mgr.GetScheme()),
+		),
+	)
 	if err != nil {
 		return err
 	}
 
 	// Build Handler function to return the list of ceph block pool
 	// This is used by the watchers below
-	handlerFunc, err := opcontroller.ObjectToCRMapper(opManagerContext, mgr.GetClient(), &cephv1.CephBlockPoolList{}, mgr.GetScheme())
+	configHandler, err := opcontroller.ObjectToCRMapper[*cephv1.CephBlockPoolList, *corev1.ConfigMap](
+		opManagerContext,
+		mgr.GetClient(),
+		&cephv1.CephBlockPoolList{},
+		mgr.GetScheme(),
+	)
 	if err != nil {
 		return err
 	}
 
 	// Watch for ConfigMap "rook-ceph-mon-endpoints" update and reconcile, which will reconcile update the bootstrap peer token
-	err = c.Watch(&source.Kind{Type: &corev1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: corev1.SchemeGroupVersion.String()}}}, handler.EnqueueRequestsFromMapFunc(handlerFunc), mon.PredicateMonEndpointChanges())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&corev1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: corev1.SchemeGroupVersion.String()}},
+			handler.TypedEnqueueRequestsFromMapFunc(configHandler),
+			mon.PredicateMonEndpointChanges(),
+		),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Build Handler function to return the list of ceph block pool
+	// This is used by the watchers below
+	secretHandler, err := opcontroller.ObjectToCRMapper[*cephv1.CephBlockPoolList, *corev1.Secret](
+		opManagerContext,
+		mgr.GetClient(),
+		&cephv1.CephBlockPoolList{},
+		mgr.GetScheme(),
+	)
+	if err != nil {
+		return err
+	}
+	// Watch for updates to the secret triggered by changes in the peer pool token
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&corev1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: corev1.SchemeGroupVersion.String()}},
+			handler.TypedEnqueueRequestsFromMapFunc(secretHandler),
+			opcontroller.WatchPeerTokenSecretPredicate(),
+		),
+	)
 	if err != nil {
 		return err
 	}
@@ -137,6 +184,7 @@ func add(opManagerContext context.Context, mgr manager.Manager, r reconcile.Reco
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCephBlockPool) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, cephBlockPool, err := r.reconcile(request)
 
@@ -167,14 +215,23 @@ func (r *ReconcileCephBlockPool) reconcile(request reconcile.Request) (reconcile
 	observedGeneration := cephBlockPool.ObjectMeta.Generation
 
 	// Set a finalizer so we can do cleanup before the object goes away
-	err = opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephBlockPool)
+	generationUpdated, err := opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephBlockPool)
 	if err != nil {
 		return opcontroller.ImmediateRetryResult, *cephBlockPool, errors.Wrap(err, "failed to add finalizer")
 	}
+	if generationUpdated {
+		logger.Infof("reconciling the ceph block pool %q after adding finalizer", cephBlockPool.Name)
+		return reconcile.Result{}, *cephBlockPool, nil
+	}
 
+	var statusErr error
 	// The CR was just created, initializing status fields
 	if cephBlockPool.Status == nil {
-		updateStatus(r.opManagerContext, r.client, request.NamespacedName, cephv1.ConditionProgressing, nil, k8sutil.ObservedGenerationNotAvailable)
+		// The pool is not available so let's not build the status Info yet
+		err = r.updateStatus(request.NamespacedName, cephv1.ConditionProgressing, k8sutil.ObservedGenerationNotAvailable, &cephv1.CephxStatus{})
+		if err != nil {
+			return opcontroller.ImmediateRetryResult, *cephBlockPool, errors.Wrapf(err, "failed to update %q status to %q", request.NamespacedName, cephv1.ConditionProgressing)
+		}
 	}
 
 	// Make sure a CephCluster is present otherwise do nothing
@@ -221,24 +278,19 @@ func (r *ReconcileCephBlockPool) reconcile(request reconcile.Request) (reconcile
 		}
 	}
 
+	poolSpec := cephBlockPool.ToNamedPoolSpec()
 	// DELETE: the CR was deleted
 	if !cephBlockPool.GetDeletionTimestamp().IsZero() {
-		deps, err := cephBlockPoolDependents(r.context, r.clusterInfo, cephBlockPool)
-		if err != nil {
-			return reconcile.Result{}, *cephBlockPool, err
-		}
-		if !deps.Empty() {
-			err := reporting.ReportDeletionBlockedDueToDependents(r.opManagerContext, logger, r.client, cephBlockPool, deps)
+		if err := r.handleDeletionBlocked(cephBlockPool, &cephCluster); err != nil {
 			return opcontroller.WaitForRequeueIfFinalizerBlocked, *cephBlockPool, err
 		}
-		reporting.ReportDeletionNotBlockedDueToDependents(r.opManagerContext, logger, r.client, r.recorder, cephBlockPool)
+
 		// If the ceph block pool is still in the map, we must remove it during CR deletion
 		// We must remove it first otherwise the checker will panic since the status/info will be nil
 		r.cancelMirrorMonitoring(cephBlockPool)
 
 		r.recorder.Event(cephBlockPool, corev1.EventTypeNormal, string(cephv1.ReconcileStarted), "starting blockpool deletion")
 
-		poolSpec := cephBlockPool.ToNamedPoolSpec()
 		logger.Infof("deleting pool %q", poolSpec.Name)
 		err = deletePool(r.context, clusterInfo, &poolSpec)
 		if err != nil {
@@ -286,7 +338,10 @@ func (r *ReconcileCephBlockPool) reconcile(request reconcile.Request) (reconcile
 			logger.Info(opcontroller.OperatorNotInitializedMessage)
 			return opcontroller.WaitForRequeueIfOperatorNotInitialized, *cephBlockPool, nil
 		}
-		updateStatus(r.opManagerContext, r.client, request.NamespacedName, cephv1.ConditionFailure, nil, k8sutil.ObservedGenerationNotAvailable)
+		statusErr = r.updateStatus(request.NamespacedName, cephv1.ConditionFailure, k8sutil.ObservedGenerationNotAvailable, nil)
+		if statusErr != nil {
+			logger.Errorf("failed to update %q status to %q: %v", request.NamespacedName, cephv1.ConditionFailure, statusErr)
+		}
 		return reconcileResponse, *cephBlockPool, errors.Wrapf(err, "failed to create pool %q.", cephBlockPool.GetName())
 	}
 
@@ -294,31 +349,28 @@ func (r *ReconcileCephBlockPool) reconcile(request reconcile.Request) (reconcile
 	if err := configureRBDStats(r.context, clusterInfo, ""); err != nil {
 		return reconcile.Result{}, *cephBlockPool, errors.Wrap(err, "failed to enable/disable stats collection for pool(s)")
 	}
-
-	poolSpec := cephBlockPool.ToNamedPoolSpec()
-	checker := newMirrorChecker(r.context, r.client, r.clusterInfo, request.NamespacedName, &poolSpec)
+	checker := cephclient.NewMirrorChecker(r.context, r.client, r.clusterInfo, request.NamespacedName, &poolSpec, cephBlockPool)
 	// ADD PEERS
 	logger.Debug("reconciling create rbd mirror peer configuration")
 	if cephBlockPool.Spec.Mirroring.Enabled {
 		// Always create a bootstrap peer token in case another cluster wants to add us as a peer
 		reconcileResponse, err = opcontroller.CreateBootstrapPeerSecret(r.context, clusterInfo, cephBlockPool, k8sutil.NewOwnerInfo(cephBlockPool, r.scheme))
 		if err != nil {
-			updateStatus(r.opManagerContext, r.client, request.NamespacedName, cephv1.ConditionFailure, nil, k8sutil.ObservedGenerationNotAvailable)
+			statusErr = r.updateStatus(request.NamespacedName, cephv1.ConditionFailure, k8sutil.ObservedGenerationNotAvailable, nil)
+			if statusErr != nil {
+				return opcontroller.ImmediateRetryResult, *cephBlockPool, errors.Wrapf(statusErr, "failed to update %q status to %q", request.NamespacedName, cephv1.ConditionFailure)
+			}
 			return reconcileResponse, *cephBlockPool, errors.Wrapf(err, "failed to create rbd-mirror bootstrap peer for pool %q.", cephBlockPool.GetName())
+		}
+
+		// update rbdMirror cephXStatus immediately after bootstrapping the peer token
+		statusErr = r.updateStatus(request.NamespacedName, cephv1.ConditionProgressing, observedGeneration, &cephCluster.Status.Cephx.RBDMirrorPeer)
+		if statusErr != nil {
+			return opcontroller.ImmediateRetryResult, *cephBlockPool, errors.Wrapf(statusErr, "failed to update %q status to %q", request.NamespacedName, cephv1.ConditionProgressing)
 		}
 
 		// Check if rbd-mirror CR and daemons are running
 		logger.Debug("listing rbd-mirror CR")
-		// Run the goroutine to update the mirroring status
-		if !cephBlockPool.Spec.StatusCheck.Mirror.Disabled {
-			// Start monitoring of the pool
-			if r.blockPoolContexts[blockPoolChannelKey].started {
-				logger.Debug("pool monitoring go routine already running!")
-			} else {
-				go checker.checkMirroring(r.blockPoolContexts[blockPoolChannelKey].internalCtx)
-				r.blockPoolContexts[blockPoolChannelKey].started = true
-			}
-		}
 
 		// Add bootstrap peer if any
 		logger.Debug("reconciling ceph bootstrap peers import")
@@ -335,20 +387,51 @@ func (r *ReconcileCephBlockPool) reconcile(request reconcile.Request) (reconcile
 
 		// update ObservedGeneration in status at the end of reconcile
 		// Set Ready status, we are done reconciling
-		updateStatus(r.opManagerContext, r.client, request.NamespacedName, cephv1.ConditionReady, opcontroller.GenerateStatusInfo(cephBlockPool), observedGeneration)
+		statusErr = r.updateStatus(request.NamespacedName, cephv1.ConditionReady, observedGeneration, nil)
+
+		if cephBlockPool.Spec.StatusCheck.Mirror.Disabled {
+			// Stop monitoring the mirroring status of this pool
+			if blockPoolContextsExists && r.blockPoolContexts[blockPoolChannelKey].started {
+				logger.Info("stop monitoring the mirroring status of the pool %q", cephBlockPool.Name)
+				r.cancelMirrorMonitoring(cephBlockPool)
+				// Reset the MirrorHealthCheckSpec
+				checker.UpdateStatusMirroring(nil, nil, nil, "")
+			}
+		} else {
+			// Start monitoring of the pool
+			if r.blockPoolContexts[blockPoolChannelKey].started {
+				logger.Debug("pool monitoring go routine already running!")
+			} else {
+				if cephBlockPool.Spec.Mirroring.Mode != "init-only" {
+					r.blockPoolContexts[blockPoolChannelKey].started = true
+					// Run the goroutine to update the mirroring status and skip when blockpool mirroing mode in init-only as radosnamespace mirroring is the right place to check
+					// mirroring status when blockpool mirroring mode is init-only.
+					go checker.CheckMirroring(r.blockPoolContexts[blockPoolChannelKey].internalCtx)
+				}
+			}
+		}
 
 		// If not mirrored there is no Status Info field to fulfil
 	} else {
+		// disable mirroring
+		err = r.disableMirroring(poolSpec.Name)
+		if err != nil {
+			logger.Warningf("failed to disable mirroring on pool %q running in ceph cluster namespace %q. %v", poolSpec.Name, r.clusterInfo.Namespace, err)
+		}
 		// update ObservedGeneration in status at the end of reconcile
 		// Set Ready status, we are done reconciling
-		updateStatus(r.opManagerContext, r.client, request.NamespacedName, cephv1.ConditionReady, nil, observedGeneration)
+		statusErr = r.updateStatus(request.NamespacedName, cephv1.ConditionReady, observedGeneration, &cephv1.CephxStatus{})
 
 		// Stop monitoring the mirroring status of this pool
 		if blockPoolContextsExists && r.blockPoolContexts[blockPoolChannelKey].started {
 			r.cancelMirrorMonitoring(cephBlockPool)
 			// Reset the MirrorHealthCheckSpec
-			checker.updateStatusMirroring(nil, nil, nil, "")
+			checker.UpdateStatusMirroring(nil, nil, nil, "")
 		}
+	}
+
+	if statusErr != nil {
+		return opcontroller.ImmediateRetryResult, *cephBlockPool, errors.Wrapf(statusErr, "failed to update status of pool %q to %q.", cephBlockPool.Name, cephv1.ConditionReady)
 	}
 
 	// Return and do not requeue
@@ -356,36 +439,112 @@ func (r *ReconcileCephBlockPool) reconcile(request reconcile.Request) (reconcile
 	return reconcile.Result{}, *cephBlockPool, nil
 }
 
+// handlePoolDeletionBlocked updates the blockpool CR status with conditions about
+// whether the pool is empty or has dependents that block deletion.
+// If the pool is not empty and force deletion is specified, create a cleanup job
+// to delete the images and snapshots forcefully.
+func (r *ReconcileCephBlockPool) handleDeletionBlocked(cephBlockPool *cephv1.CephBlockPool, cephCluster *cephv1.CephCluster) error {
+	poolSpec := cephBlockPool.ToNamedPoolSpec()
+	deletionBlocked := false
+
+	deps, err := cephBlockPoolDependents(r.context, r.clusterInfo, cephBlockPool)
+	if err != nil {
+		return err
+	}
+	var depCondition cephv1.Condition
+	if deps.Empty() {
+		_, _, depCondition = reporting.GenerateConditionUnblockedDueToDependents(cephBlockPool)
+	} else {
+		deletionBlocked = true
+		_, _, depCondition = reporting.GenerateConditionBlockedDueToDependents(cephBlockPool, deps)
+	}
+	logger.Info(depCondition.Message)
+
+	radosNamespaces := deps.OfKind(radosNamespacesKeyName)
+	poolPresent, err := cephclient.IsPoolPresent(r.context, r.clusterInfo, poolSpec.Name)
+	if err != nil {
+		return errors.Wrap(err, "failed to check pool presence")
+	}
+	var isEmpty bool
+	var emptyMessage string
+	if poolPresent {
+		isEmpty, emptyMessage, err = cephclient.IsPoolEmpty(r.context, r.clusterInfo, poolSpec.Name, radosNamespaces)
+		if err != nil {
+			return err
+		}
+	} else {
+		emptyMessage = fmt.Sprintf("pool %q is not found in cluster", poolSpec.Name)
+	}
+	var emptyCondition cephv1.Condition
+	if isEmpty || !poolPresent {
+		emptyCondition = dependents.DeletionBlockedDueToNonEmptyPoolCondition(false, emptyMessage)
+	} else {
+		deletionBlocked = true
+		emptyCondition = dependents.DeletionBlockedDueToNonEmptyPoolCondition(true, emptyMessage)
+	}
+	logger.Info(emptyCondition.Message)
+
+	nsName := types.NamespacedName{Namespace: cephBlockPool.Namespace, Name: cephBlockPool.Name}
+	err = reporting.UpdateStatusConditionsWithRetry(
+		r.opManagerContext, r.client, cephBlockPool, nsName, cephBlockPool.Kind, emptyCondition, depCondition)
+	if err != nil {
+		logger.Warningf("failed to update %q status with deletion blocked conditions: %v", nsName.String(), err)
+	}
+
+	if !isEmpty {
+		// Force deletion if desired
+		if opcontroller.ForceDeleteRequested(cephBlockPool.GetAnnotations()) {
+			cleanupErr := r.cleanup(cephBlockPool, cephCluster)
+			if cleanupErr != nil {
+				return errors.Wrapf(cleanupErr, "failed to create clean up job for ceph blockpool %q", cephBlockPool.Name)
+			}
+		}
+	}
+
+	if deletionBlocked {
+		return errors.Errorf("pool %q cannot be deleted because it is not empty or has dependents", cephBlockPool.Name)
+	}
+	return nil
+}
+
 func (r *ReconcileCephBlockPool) reconcileCreatePool(clusterInfo *cephclient.ClusterInfo, cephCluster *cephv1.ClusterSpec, cephBlockPool *cephv1.CephBlockPool) (reconcile.Result, error) {
 	poolSpec := cephBlockPool.ToNamedPoolSpec()
 	err := createPool(r.context, clusterInfo, cephCluster, &poolSpec)
 	if err != nil {
-		return opcontroller.ImmediateRetryResult, errors.Wrapf(err, "failed to create pool %q.", cephBlockPool.GetName())
+		return opcontroller.ImmediateRetryResult, errors.Wrapf(err, "failed to configure pool %q.", cephBlockPool.GetName())
 	}
 
 	// Let's return here so that on the initial creation we don't check for update right away
 	return reconcile.Result{}, nil
 }
 
+func (r *ReconcileCephBlockPool) cleanup(cephblockpool *cephv1.CephBlockPool, cephCluster *cephv1.CephCluster) error {
+	logger.Infof("starting cleanup of the ceph resources for CephBlockPool %q in k8s namespace %q", cephblockpool.Name, cephblockpool.Namespace)
+	cleanupConfig := map[string]string{
+		opcontroller.CephBlockPoolNameEnv: cephblockpool.Name,
+	}
+	cleanup := opcontroller.NewResourceCleanup(cephblockpool, cephCluster, r.opConfig.Image, cleanupConfig)
+	jobName := k8sutil.TruncateNodeNameForJob("cleanup-cephblockpool-%s", cephblockpool.Name)
+	err := cleanup.StartJob(r.clusterInfo.Context, r.context.Clientset, jobName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to run clean up job to clean the cephblockpool %q", cephblockpool.Name)
+	}
+	return nil
+}
+
 // Create the pool
 func createPool(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, clusterSpec *cephv1.ClusterSpec, p *cephv1.NamedPoolSpec) error {
-	// Set the application name to rbd by default, but override for special pools
-	appName := poolApplicationNameRBD
-	if p.Name == "device_health_metrics" {
-		appName = "mgr_devicehealth"
-	} else if p.Name == ".mgr" {
-		appName = "mgr"
-	} else if p.Name == ".nfs" {
-		appName = "nfs"
+	// Set the application name to rbd by default, but override later for special pools
+	if p.Application == "" {
+		p.Application = poolApplicationNameRBD
 	}
-
 	// create the pool
 	logger.Infof("creating pool %q in namespace %q", p.Name, clusterInfo.Namespace)
-	if err := cephclient.CreatePool(context, clusterInfo, clusterSpec, *p, appName); err != nil {
-		return errors.Wrapf(err, "failed to create pool %q", p.Name)
+	if err := cephclient.CreatePool(context, clusterInfo, clusterSpec, p); err != nil {
+		return errors.Wrapf(err, "failed to configure pool %q", p.Name)
 	}
 
-	if appName != poolApplicationNameRBD {
+	if p.Application != poolApplicationNameRBD {
 		return nil
 	}
 	logger.Infof("initializing pool %q for RBD use", p.Name)
@@ -401,53 +560,64 @@ func createPool(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, 
 
 // Delete the pool
 func deletePool(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, p *cephv1.NamedPoolSpec) error {
-	pools, err := cephclient.ListPoolSummaries(context, clusterInfo)
+	poolPresent, err := cephclient.IsPoolPresent(context, clusterInfo, p.Name)
 	if err != nil {
-		return errors.Wrap(err, "failed to list pools")
+		return errors.Wrap(err, "failed to check pool presence")
 	}
-
-	// Only delete the pool if it exists...
-	for _, pool := range pools {
-		if pool.Name == p.Name {
-			err := cephclient.DeletePool(context, clusterInfo, p.Name)
-			if err != nil {
-				return errors.Wrapf(err, "failed to delete pool %q", p.Name)
-			}
+	if poolPresent {
+		err := cephclient.DeletePool(context, clusterInfo, p.Name)
+		if err != nil {
+			return errors.Wrapf(err, "failed to delete pool %q", p.Name)
 		}
 	}
-
 	return nil
 }
 
-// remove removes any element from a list
-func remove(list []string, s string) []string {
-	for i, v := range list {
-		if v == s {
-			list = append(list[:i], list[i+1:]...)
+// generateStatsPoolList combines existingStatsPools and rookStatsPools, removes items in removePools,
+// removes duplicates, ensures no empty strings, and returns a comma-separated string in a deterministic order.
+func generateStatsPoolList(existingStatsPools []string, rookStatsPools []string, removePools []string) string {
+	poolList := []string{}
+
+	// Helper function to add a poolList if it's not in the removePools list and not already in poolList
+	addUniquePool := func(pool string) {
+		if pool == "" {
+			return
 		}
+		// Check if the pool should be removed or already exists in poolList
+		if contains(removePools, pool) || contains(poolList, pool) {
+			return
+		}
+		poolList = append(poolList, pool)
+	}
+	for _, pool := range existingStatsPools {
+		addUniquePool(pool)
+	}
+	for _, pool := range rookStatsPools {
+		addUniquePool(pool)
 	}
 
-	return list
+	sort.Strings(poolList) // Sort the list to ensure deterministic output
+
+	return strings.Join(poolList, ",")
 }
 
-// Remove duplicate entries from slice
-func removeDuplicates(slice []string) []string {
-	inResult := make(map[string]bool)
-	var result []string
-	for _, str := range slice {
-		if _, ok := inResult[str]; !ok {
-			inResult[str] = true
-			result = append(result, str)
+// Helper function to check if a slice contains a string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
 		}
 	}
-	return result
+	return false
 }
 
 func configureRBDStats(clusterContext *clusterd.Context, clusterInfo *cephclient.ClusterInfo, deletedPool string) error {
 	logger.Debug("configuring RBD per-image IO statistics collection")
 	namespaceListOpt := client.InNamespace(clusterInfo.Namespace)
 	cephBlockPoolList := &cephv1.CephBlockPoolList{}
-	var enableStatsForCephBlockPools []string
+	var rookStatsPools []string
+	var removePools []string
+
 	err := clusterContext.Client.List(clusterInfo.Context, cephBlockPoolList, namespaceListOpt)
 	if err != nil {
 		return errors.Wrap(err, "failed to retrieve list of CephBlockPool")
@@ -455,28 +625,28 @@ func configureRBDStats(clusterContext *clusterd.Context, clusterInfo *cephclient
 	for _, cephBlockPool := range cephBlockPoolList.Items {
 		if cephBlockPool.GetDeletionTimestamp() == nil && cephBlockPool.Spec.EnableRBDStats {
 			// add to list of CephBlockPool with enableRBDStats set to true and not marked for deletion
-			enableStatsForCephBlockPools = append(enableStatsForCephBlockPools, cephBlockPool.ToNamedPoolSpec().Name)
+			rookStatsPools = append(rookStatsPools, cephBlockPool.ToNamedPoolSpec().Name)
+		} else {
+			removePools = append(removePools, cephBlockPool.ToNamedPoolSpec().Name)
 		}
 	}
-	enableStatsForCephBlockPools = remove(enableStatsForCephBlockPools, deletedPool)
+	if deletedPool != "" {
+		removePools = append(removePools, deletedPool)
+	}
 	monStore := config.GetMonStore(clusterContext, clusterInfo)
 	// Check for existing rbd stats pools
-	existingRBDStatsPools, e := monStore.Get("mgr", "mgr/prometheus/rbd_stats_pools")
+	existingStatsPools, e := monStore.Get("mgr", "mgr/prometheus/rbd_stats_pools")
 	if e != nil {
 		return errors.Wrapf(e, "failed to get rbd_stats_pools")
 	}
-
-	existingRBDStatsPoolsList := strings.Split(existingRBDStatsPools, ",")
-	enableStatsForPools := append(enableStatsForCephBlockPools, existingRBDStatsPoolsList...)
-	enableStatsForPools = removeDuplicates(enableStatsForPools)
-
+	existingStatsPoolsList := strings.Split(existingStatsPools, ",")
+	enableStatsForPools := generateStatsPoolList(existingStatsPoolsList, rookStatsPools, removePools)
 	logger.Debugf("RBD per-image IO statistics will be collected for pools: %v", enableStatsForPools)
-
 	if len(enableStatsForPools) == 0 {
 		err = monStore.Delete("mgr", "mgr/prometheus/rbd_stats_pools")
 	} else {
 		// appending existing rbd stats pools if any
-		err = monStore.Set("mgr", "mgr/prometheus/rbd_stats_pools", strings.Trim(strings.Join(enableStatsForPools, ","), ","))
+		err = monStore.Set("mgr", "mgr/prometheus/rbd_stats_pools", enableStatsForPools)
 	}
 	if err != nil {
 		return errors.Wrapf(err, "failed to enable rbd_stats_pools")
@@ -501,4 +671,80 @@ func (r *ReconcileCephBlockPool) cancelMirrorMonitoring(cephBlockPool *cephv1.Ce
 		// Remove ceph block pool from the map
 		delete(r.blockPoolContexts, channelKey)
 	}
+}
+
+func (r *ReconcileCephBlockPool) disableMirroring(pool string) error {
+	mirrorInfo, err := cephclient.GetPoolMirroringInfo(r.context, r.clusterInfo, pool)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get mirroring info for the pool %q", pool)
+	}
+	if mirrorInfo.Mode == "disabled" {
+		return nil
+	}
+
+	mirroringEnabled, err := r.isAnyRadosNamespaceMirrored(pool)
+	if err != nil {
+		return errors.Wrap(err, "failed to check if any rados namespace is mirrored")
+	}
+	if mirroringEnabled {
+		logger.Debugf("disabling mirroring on pool %q is not possible. There are mirrored rados namespaces in the pool running in ceph cluster namespace %q", pool, r.clusterInfo.Namespace)
+		return errors.New("mirroring must be disabled in all radosnamespaces in the pool before disabling mirroring in the pool")
+	}
+
+	if mirrorInfo.Mode == "image" {
+		mirroredPools, err := cephclient.GetMirroredPoolImages(r.context, r.clusterInfo, pool)
+		if err != nil {
+			return errors.Wrapf(err, "failed to list mirrored images for pool %q", pool)
+		}
+
+		if len(*mirroredPools.Images) > 0 {
+			msg := fmt.Sprintf("there are images in the pool %q. Please manually disable mirroring for each image", pool)
+			logger.Errorf("%s", msg)
+			return errors.New(msg)
+		}
+	}
+
+	// Remove storage cluster peers
+	for _, peer := range mirrorInfo.Peers {
+		if peer.UUID != "" {
+			err := cephclient.RemoveClusterPeer(r.context, r.clusterInfo, pool, peer.UUID)
+			if err != nil {
+				return errors.Wrapf(err, "failed to remove cluster peer with UUID %q for the pool %q", peer.UUID, pool)
+			}
+			logger.Infof("successfully removed peer site %q for the pool %q", peer.UUID, pool)
+		}
+	}
+
+	// Disable mirroring on pool
+	err = cephclient.DisablePoolMirroring(r.context, r.clusterInfo, pool)
+	if err != nil {
+		return errors.Wrapf(err, "failed to disable mirroring for pool %q", pool)
+	}
+	logger.Infof("successfully disabled mirroring on the pool %q", pool)
+
+	return nil
+}
+
+func (r *ReconcileCephBlockPool) isAnyRadosNamespaceMirrored(poolName string) (bool, error) {
+	logger.Debugf("list rados namespace in pool %q running in ceph cluster namespace %q", poolName, r.clusterInfo.Namespace)
+
+	list, err := cephclient.ListRadosNamespacesInPool(r.context, r.clusterInfo, poolName)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to list rados namespace in pool %q", poolName)
+	}
+	logger.Debugf("rados namespace list %v in pool %q running in ceph cluster namespace %q", list, poolName, r.clusterInfo.Namespace)
+
+	for _, namespace := range list {
+		poolAndRadosNamespaceName := fmt.Sprintf("%s/%s", poolName, namespace)
+		mirrorInfo, err := cephclient.GetPoolMirroringInfo(r.context, r.clusterInfo, poolAndRadosNamespaceName)
+		if err != nil {
+			return false, errors.Wrapf(err, "failed to get mirroring info for the rados namespace %q", poolAndRadosNamespaceName)
+		}
+		logger.Debugf("mirroring info for the rados namespace %q running in ceph cluster namespace %q: %v", poolAndRadosNamespaceName, r.clusterInfo.Namespace, mirrorInfo)
+		if mirrorInfo.Mode != "disabled" {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

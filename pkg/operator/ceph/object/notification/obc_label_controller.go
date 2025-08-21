@@ -19,6 +19,7 @@ package notification
 
 import (
 	"context"
+	"reflect"
 	"strings"
 
 	bktv1alpha1 "github.com/kube-object-storage/lib-bucket-provisioner/pkg/apis/objectbucket.io/v1alpha1"
@@ -37,14 +38,18 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
-	notificationLabelPrefix = "bucket-notification-"
+	notificationLabelPrefix   = "bucket-notification-"
+	bucketProvisionerLabelKey = "bucket-provisioner"
+	bucketProvisionerLabelVal = "ceph.rook.io-bucket"
 )
 
 // ReconcileOBCLabels reconciles a ObjectBucketClaim labels
@@ -53,6 +58,47 @@ type ReconcileOBCLabels struct {
 	context          *clusterd.Context
 	opManagerContext context.Context
 	recorder         record.EventRecorder
+}
+
+func obcPredicate[T *bktv1alpha1.ObjectBucketClaim]() predicate.TypedFuncs[T] {
+	return predicate.TypedFuncs[T]{
+		CreateFunc: func(e event.TypedCreateEvent[T]) bool {
+			obj := (*bktv1alpha1.ObjectBucketClaim)(e.Object)
+
+			logger.Debugf("create event from a CR: %q", obj.GetName())
+			return true
+		},
+		DeleteFunc: func(e event.TypedDeleteEvent[T]) bool {
+			obj := (*bktv1alpha1.ObjectBucketClaim)(e.Object)
+
+			logger.Debugf("delete event from a CR: %q", obj.GetName())
+			return true
+		},
+		UpdateFunc: func(e event.TypedUpdateEvent[T]) bool {
+			// break generic-ness in order to access .Spec.ObjectBucketName
+			objOld := (*bktv1alpha1.ObjectBucketClaim)(e.ObjectOld)
+			objNew := (*bktv1alpha1.ObjectBucketClaim)(e.ObjectNew)
+
+			logger.Debug("update event on ObjectBucketClaim CR")
+			// If the labels "do_not_reconcile" is set on the object, let's not reconcile that request
+			if opcontroller.IsDoNotReconcile(objNew.GetLabels()) {
+				logger.Debugf("object %q matched on update but %q label is set, doing nothing", objNew.GetName(), opcontroller.DoNotReconcileLabelName)
+				return false
+			}
+			if !reflect.DeepEqual(objOld.GetLabels(), objNew.GetLabels()) {
+				logger.Infof("CR labels has changed for %q", objNew.GetName())
+				return true
+			} else if objOld.Spec.ObjectBucketName != objNew.Spec.ObjectBucketName {
+				logger.Infof("CR %q bucket name changed from %q to %q", objNew.GetName(), objOld.Spec.ObjectBucketName, objNew.Spec.ObjectBucketName)
+				return true
+			}
+			logger.Debugf("no change in CR %q", objNew.GetName())
+			return false
+		},
+		GenericFunc: func(e event.TypedGenericEvent[T]) bool {
+			return false
+		},
+	}
 }
 
 func addOBCLabelReconciler(mgr manager.Manager, r reconcile.Reconciler) error {
@@ -64,7 +110,14 @@ func addOBCLabelReconciler(mgr manager.Manager, r reconcile.Reconciler) error {
 	logger.Info("successfully started")
 
 	// Watch for changes on the OBC CRD object
-	err = c.Watch(&source.Kind{Type: &bktv1alpha1.ObjectBucketClaim{}}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&bktv1alpha1.ObjectBucketClaim{},
+			&handler.TypedEnqueueRequestForObject[*bktv1alpha1.ObjectBucketClaim]{},
+			obcPredicate(),
+		),
+	)
 	if err != nil {
 		return err
 	}
@@ -77,6 +130,7 @@ func addOBCLabelReconciler(mgr manager.Manager, r reconcile.Reconciler) error {
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileOBCLabels) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, err := r.reconcile(request)
 	if err != nil {
@@ -109,7 +163,7 @@ func (r *ReconcileOBCLabels) reconcile(request reconcile.Request) (reconcile.Res
 
 	// reschedule if ObjectBucket was not created yet
 	if obc.Spec.ObjectBucketName == "" {
-		logger.Infof("ObjectBucketClaim %q resource did not create the bucket yet. will retry", request.NamespacedName)
+		logger.Debugf("ObjectBucketClaim %q resource did not create the bucket yet. will retry", request.NamespacedName)
 		return waitForRequeueIfObjectBucketNotReady, nil
 	}
 
@@ -119,11 +173,18 @@ func (r *ReconcileOBCLabels) reconcile(request reconcile.Request) (reconcile.Res
 	if err := r.client.Get(r.opManagerContext, bucketName, &ob); err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "failed to retrieve ObjectBucket %q", bucketName)
 	}
+
+	// validate if the bucket is provisioned by the ceph provisioner
+	if !strings.Contains(ob.Labels[bucketProvisionerLabelKey], bucketProvisionerLabelVal) {
+		logger.Debugf("ObjectBucket %q was not provisioned by the ceph object store provisioner and tagged with provisioner %q. ignoring",
+			bucketName, ob.Labels[bucketProvisionerLabelKey])
+		return reconcile.Result{}, nil
+	}
+	// validate object store name
 	objectStoreName, err := getCephObjectStoreName(ob)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "failed to get object store from ObjectBucket %q", bucketName)
 	}
-
 	// Populate clusterInfo during each reconcile
 	clusterInfo, clusterSpec, err := getReadyCluster(r.client, r.opManagerContext, *r.context, objectStoreName.Namespace)
 	if err != nil {

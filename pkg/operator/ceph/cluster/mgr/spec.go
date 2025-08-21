@@ -43,7 +43,7 @@ const (
 func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error) {
 	logger.Debugf("mgrConfig: %+v", mgrConfig)
 
-	volumes := controller.DaemonVolumes(mgrConfig.DataPathMap, mgrConfig.ResourceName)
+	volumes := controller.DaemonVolumes(mgrConfig.DataPathMap, mgrConfig.ResourceName, c.spec.DataDirHostPath)
 	if c.spec.Network.IsMultus() {
 		adminKeyringVol, _ := keyring.Volume().Admin(), keyring.VolumeMount().Admin()
 		volumes = append(volumes, adminKeyringVol)
@@ -61,6 +61,7 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 			Containers: []v1.Container{
 				c.makeMgrDaemonContainer(mgrConfig),
 			},
+			SecurityContext:    &v1.PodSecurityContext{},
 			ServiceAccountName: serviceAccountName,
 			RestartPolicy:      v1.RestartPolicyAlways,
 			Volumes:            volumes,
@@ -74,12 +75,26 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 	if c.spec.Mgr.Count > 1 {
 		podSpec.Spec.Containers = append(podSpec.Spec.Containers, c.makeMgrSidecarContainer(mgrConfig))
 		matchLabels := controller.AppLabels(AppName, c.clusterInfo.Namespace)
-		podSpec.Spec.Volumes = append(podSpec.Spec.Volumes, mon.CephSecretVolume())
+		// append ceph secret volume and some empty volumes needed by the mgr sidecar
+		podSpec.Spec.Volumes = append(podSpec.Spec.Volumes,
+			v1.Volume{
+				Name: "rook-config",
+				VolumeSource: v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{},
+				},
+			},
+			v1.Volume{
+				Name: "default-config-dir",
+				VolumeSource: v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{},
+				},
+			},
+			mon.CephSecretVolume())
 
-		// Stretch the mgrs across hosts by default, or across a bigger failure domain for stretch clusters
-		topologyKey := v1.LabelHostname
-		if c.spec.IsStretchCluster() {
-			topologyKey = mon.StretchFailureDomainLabel(c.spec)
+		// Stretch the mgrs across hosts by default, or across a bigger failure domain for when zones are required like in case of stretched cluster
+		topologyKey := k8sutil.LabelHostname()
+		if c.spec.ZonesRequired() {
+			topologyKey = mon.GetFailureDomainLabel(c.spec)
 		}
 		k8sutil.SetNodeAntiAffinityForPod(&podSpec.Spec, !c.spec.Mgr.AllowMultiplePerNode, topologyKey, matchLabels, nil)
 	}
@@ -88,7 +103,7 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 	if c.spec.LogCollector.Enabled {
 		shareProcessNamespace := true
 		podSpec.Spec.ShareProcessNamespace = &shareProcessNamespace
-		podSpec.Spec.Containers = append(podSpec.Spec.Containers, *controller.LogCollectorContainer(fmt.Sprintf("ceph-mgr.%s", mgrConfig.DaemonID), c.clusterInfo.Namespace, c.spec))
+		podSpec.Spec.Containers = append(podSpec.Spec.Containers, *controller.LogCollectorContainer(fmt.Sprintf("ceph-mgr.%s", mgrConfig.DaemonID), c.clusterInfo.Namespace, c.spec, nil))
 	}
 
 	// Replace default unreachable node toleration
@@ -97,7 +112,7 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 	if c.spec.Network.IsHost() {
 		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	} else if c.spec.Network.IsMultus() {
-		if err := k8sutil.ApplyMultus(c.spec.Network, &podSpec.ObjectMeta); err != nil {
+		if err := k8sutil.ApplyMultus(c.clusterInfo.Namespace, &c.spec.Network, &podSpec.ObjectMeta); err != nil {
 			return nil, err
 		}
 		podSpec.Spec.Containers = append(podSpec.Spec.Containers, c.makeCmdProxySidecarContainer(mgrConfig))
@@ -116,6 +131,7 @@ func (c *Cluster) makeDeployment(mgrConfig *mgrConfig) (*apps.Deployment, error)
 			Labels:    c.getPodLabels(mgrConfig, true),
 		},
 		Spec: apps.DeploymentSpec{
+			RevisionHistoryLimit: controller.RevisionHistoryLimit(),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: c.getPodLabels(mgrConfig, false),
 			},
@@ -141,14 +157,14 @@ func (c *Cluster) makeChownInitContainer(mgrConfig *mgrConfig) v1.Container {
 		*mgrConfig.DataPathMap,
 		c.spec.CephVersion.Image,
 		controller.GetContainerImagePullPolicy(c.spec.CephVersion.ImagePullPolicy),
-		controller.DaemonVolumeMounts(mgrConfig.DataPathMap, mgrConfig.ResourceName),
+		controller.DaemonVolumeMounts(mgrConfig.DataPathMap, mgrConfig.ResourceName, c.spec.DataDirHostPath),
 		cephv1.GetMgrResources(c.spec.Resources),
-		controller.PodSecurityContext(),
+		controller.DefaultContainerSecurityContext(),
+		"",
 	)
 }
 
 func (c *Cluster) makeMgrDaemonContainer(mgrConfig *mgrConfig) v1.Container {
-
 	container := v1.Container{
 		Name: "mgr",
 		Command: []string{
@@ -164,7 +180,7 @@ func (c *Cluster) makeMgrDaemonContainer(mgrConfig *mgrConfig) v1.Container {
 		),
 		Image:           c.spec.CephVersion.Image,
 		ImagePullPolicy: controller.GetContainerImagePullPolicy(c.spec.CephVersion.ImagePullPolicy),
-		VolumeMounts:    controller.DaemonVolumeMounts(mgrConfig.DataPathMap, mgrConfig.ResourceName),
+		VolumeMounts:    controller.DaemonVolumeMounts(mgrConfig.DataPathMap, mgrConfig.ResourceName, c.spec.DataDirHostPath),
 		Ports: []v1.ContainerPort{
 			{
 				Name:          "mgr",
@@ -178,16 +194,16 @@ func (c *Cluster) makeMgrDaemonContainer(mgrConfig *mgrConfig) v1.Container {
 			},
 			{
 				Name:          "dashboard",
-				ContainerPort: int32(c.dashboardInternalPort()),
+				ContainerPort: int32(c.dashboardInternalPort()), // nolint:gosec // G115 port numbers will not overflow an int32
 				Protocol:      v1.ProtocolTCP,
 			},
 		},
 		Env: append(
-			controller.DaemonEnvVars(c.spec.CephVersion.Image),
+			controller.DaemonEnvVars(&c.spec),
 			c.cephMgrOrchestratorModuleEnvs()...,
 		),
 		Resources:       cephv1.GetMgrResources(c.spec.Resources),
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: controller.DefaultContainerSecurityContext(),
 		StartupProbe:    controller.GenerateStartupProbeExecDaemon(config.MgrType, mgrConfig.DaemonID),
 		LivenessProbe:   controller.GenerateLivenessProbeExecDaemon(config.MgrType, mgrConfig.DaemonID),
 		WorkingDir:      config.VarLogCephDir,
@@ -224,6 +240,18 @@ func (c *Cluster) makeMgrSidecarContainer(mgrConfig *mgrConfig) v1.Container {
 		{Name: "ROOK_CEPH_VERSION", Value: "ceph version " + c.clusterInfo.CephVersion.String()},
 	}
 
+	volumeMounts := []v1.VolumeMount{
+		{
+			MountPath: "/var/lib/rook",
+			Name:      "rook-config",
+		},
+		{
+			MountPath: "/etc/ceph",
+			Name:      "default-config-dir",
+		},
+	}
+	volumeMounts = append(volumeMounts, mon.CephSecretVolumeMount())
+
 	return v1.Container{
 		Args:            []string{"ceph", "mgr", "watch-active"},
 		Name:            "watch-active",
@@ -231,8 +259,8 @@ func (c *Cluster) makeMgrSidecarContainer(mgrConfig *mgrConfig) v1.Container {
 		ImagePullPolicy: controller.GetContainerImagePullPolicy(c.spec.CephVersion.ImagePullPolicy),
 		Env:             envVars,
 		Resources:       cephv1.GetMgrSidecarResources(c.spec.Resources),
-		SecurityContext: controller.PrivilegedContext(true),
-		VolumeMounts:    []v1.VolumeMount{mon.CephSecretVolumeMount()},
+		SecurityContext: controller.DefaultContainerSecurityContext(),
+		VolumeMounts:    volumeMounts,
 	}
 }
 
@@ -244,18 +272,19 @@ func (c *Cluster) makeCmdProxySidecarContainer(mgrConfig *mgrConfig) v1.Containe
 		Args:            []string{"infinity"},
 		Image:           c.spec.CephVersion.Image,
 		ImagePullPolicy: controller.GetContainerImagePullPolicy(c.spec.CephVersion.ImagePullPolicy),
-		VolumeMounts:    append(controller.DaemonVolumeMounts(mgrConfig.DataPathMap, mgrConfig.ResourceName), adminKeyringVolMount),
-		Env:             append(controller.DaemonEnvVars(c.spec.CephVersion.Image), v1.EnvVar{Name: "CEPH_ARGS", Value: fmt.Sprintf("-m $(ROOK_CEPH_MON_HOST) -k %s", keyring.VolumeMount().AdminKeyringFilePath())}),
+		VolumeMounts:    append(controller.DaemonVolumeMounts(mgrConfig.DataPathMap, mgrConfig.ResourceName, c.spec.DataDirHostPath), adminKeyringVolMount),
+		Env:             append(controller.DaemonEnvVars(&c.spec), v1.EnvVar{Name: "CEPH_ARGS", Value: fmt.Sprintf("-m $(ROOK_CEPH_MON_HOST) -k %s", keyring.VolumeMount().AdminKeyringFilePath())}),
 		Resources:       cephv1.GetMgrResources(c.spec.Resources),
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: controller.DefaultContainerSecurityContext(),
 	}
 
 	return container
 }
 
 // MakeMetricsService generates the Kubernetes service object for the monitoring service
-func (c *Cluster) MakeMetricsService(name, activeDaemon, servicePortMetricName string) (*v1.Service, error) {
-	labels := c.selectorLabels(activeDaemon)
+func (c *Cluster) MakeMetricsService(name, servicePortMetricName string) (*v1.Service, error) {
+	labels := controller.AppLabels(AppName, c.clusterInfo.Namespace)
+	selectorLabels := c.buildSelectorLabels(labels)
 
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -277,7 +306,7 @@ func (c *Cluster) MakeMetricsService(name, activeDaemon, servicePortMetricName s
 
 	// If the cluster is external we don't need to add the selector
 	if name != controller.ExternalMgrAppName {
-		svc.Spec.Selector = labels
+		svc.Spec.Selector = selectorLabels
 	}
 
 	err := c.clusterInfo.OwnerInfo.SetControllerReference(svc)
@@ -287,8 +316,9 @@ func (c *Cluster) MakeMetricsService(name, activeDaemon, servicePortMetricName s
 	return svc, nil
 }
 
-func (c *Cluster) makeDashboardService(name, activeDaemon string) (*v1.Service, error) {
-	labels := c.selectorLabels(activeDaemon)
+func (c *Cluster) makeDashboardService(name string) (*v1.Service, error) {
+	labels := controller.AppLabels(AppName, c.clusterInfo.Namespace)
+	selectorLabels := c.buildSelectorLabels(labels)
 
 	portName := "https-dashboard"
 	if !c.spec.Dashboard.SSL {
@@ -301,20 +331,22 @@ func (c *Cluster) makeDashboardService(name, activeDaemon string) (*v1.Service, 
 			Labels:    labels,
 		},
 		Spec: v1.ServiceSpec{
-			Selector: labels,
+			Selector: selectorLabels,
 			Type:     v1.ServiceTypeClusterIP,
 			Ports: []v1.ServicePort{
 				{
 					Name: portName,
-					Port: int32(c.dashboardPublicPort()),
+					Port: int32(c.dashboardPublicPort()), // nolint:gosec // G115 port numbers will not overflow an int32
 					TargetPort: intstr.IntOrString{
-						IntVal: int32(c.dashboardInternalPort()),
+						IntVal: int32(c.dashboardInternalPort()), // nolint:gosec // G115 port numbers will not overflow an int32
 					},
 					Protocol: v1.ProtocolTCP,
 				},
 			},
 		},
 	}
+	cephv1.GetDashboardAnnotations(c.spec.Annotations).ApplyToObjectMeta(&svc.ObjectMeta)
+	cephv1.GetDashboardLabels(c.spec.Labels).ApplyToObjectMeta(&svc.ObjectMeta)
 	err := c.clusterInfo.OwnerInfo.SetControllerReference(svc)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to set owner reference to dashboard service %q", svc.Name)
@@ -326,6 +358,10 @@ func (c *Cluster) getPodLabels(mgrConfig *mgrConfig, includeNewLabels bool) map[
 	labels := controller.CephDaemonAppLabels(AppName, c.clusterInfo.Namespace, config.MgrType, mgrConfig.DaemonID, c.clusterInfo.NamespacedName().Name, "cephclusters.ceph.rook.io", includeNewLabels)
 	// leave "instance" key for legacy usage
 	labels["instance"] = mgrConfig.DaemonID
+	if includeNewLabels {
+		// default to the active mgr label, and allow the sidecar to update if it's in standby mode
+		labels[mgrRoleLabelName] = activeMgrStatus
+	}
 	return labels
 }
 
@@ -346,15 +382,17 @@ func (c *Cluster) cephMgrOrchestratorModuleEnvs() []v1.EnvVar {
 		{Name: "ROOK_OPERATOR_NAMESPACE", Value: operatorNamespace},
 		{Name: "ROOK_CEPH_CLUSTER_CRD_VERSION", Value: cephv1.Version},
 		{Name: "ROOK_CEPH_CLUSTER_CRD_NAME", Value: c.clusterInfo.NamespacedName().Name},
+		{Name: "CEPH_ARGS", Value: fmt.Sprintf("--mon-host $(ROOK_CEPH_MON_HOST) --keyring %s", keyring.VolumeMount().KeyringFilePath())},
 		k8sutil.PodIPEnvVar(podIPEnvVar),
 	}
 	return envVars
 }
 
-func (c *Cluster) selectorLabels(activeDaemon string) map[string]string {
-	labels := controller.AppLabels(AppName, c.clusterInfo.Namespace)
-	if activeDaemon != "" {
-		labels[controller.DaemonIDLabel] = activeDaemon
+func (c *Cluster) buildSelectorLabels(labels map[string]string) map[string]string {
+	selectorLabels := make(map[string]string)
+	for k, v := range labels {
+		selectorLabels[k] = v
 	}
-	return labels
+	selectorLabels["mgr_role"] = "active"
+	return selectorLabels
 }

@@ -23,6 +23,14 @@ to also change `ROOK_OPERATOR_NAMESPACE` to create a new Rook Operator for each 
 forget to set `ROOK_CURRENT_NAMESPACE_ONLY`), or you can leave it at the same value for every
 Ceph cluster if you only wish to have one Operator manage all Ceph clusters.
 
+If the operator namespace is different from the cluster namespace, the operator namespace must be
+created before running the steps below. The cluster namespace does not need to be created first,
+as it will be created by `common.yaml` in the script below.
+
+```console
+kubectl create namespace $ROOK_OPERATOR_NAMESPACE
+```
+
 This will help you manage namespaces more easily, but you should still make sure the resources are
 configured to your liking.
 
@@ -37,22 +45,36 @@ sed -i.bak \
     -e "s/\(.*\):.*# namespace:cluster/\1: $ROOK_CLUSTER_NAMESPACE # namespace:cluster/g" \
     -e "s/\(.*serviceaccount\):.*:\(.*\) # serviceaccount:namespace:operator/\1:$ROOK_OPERATOR_NAMESPACE:\2 # serviceaccount:namespace:operator/g" \
     -e "s/\(.*serviceaccount\):.*:\(.*\) # serviceaccount:namespace:cluster/\1:$ROOK_CLUSTER_NAMESPACE:\2 # serviceaccount:namespace:cluster/g" \
-    -e "s/\(.*\): [-_A-Za-z0-9]*\.\(.*\) # driver:namespace:operator/\1: $ROOK_OPERATOR_NAMESPACE.\2 # driver:namespace:operator/g" \
     -e "s/\(.*\): [-_A-Za-z0-9]*\.\(.*\) # driver:namespace:cluster/\1: $ROOK_CLUSTER_NAMESPACE.\2 # driver:namespace:cluster/g" \
   common.yaml operator.yaml cluster.yaml # add other files or change these as desired for your config
 
 # You need to use `apply` for all Ceph clusters after the first if you have only one Operator
-kubectl apply -f common.yaml -f operator.yaml -f cluster.yaml # add other files as desired for yourconfig
+kubectl apply -f crds.yaml -f common.yaml -f operator.yaml -f cluster.yaml # add other files as desired for yourconfig
 ```
+
+Also see the CSI driver
+[documentation](../Ceph-CSI/ceph-csi-drivers.md#Configure-CSI-Drivers-in-non-default-namespace)
+to update the csi provisioner names in the storageclass and volumesnapshotclass.
 
 ## Deploying a second cluster
 
-If you wish to create a new CephCluster in a different namespace than `rook-ceph` while using a single operator to manage both clusters execute the following:
+If you wish to create a new CephCluster in a separate namespace, you can easily do so
+by modifying the `ROOK_OPERATOR_NAMESPACE` and `SECOND_ROOK_CLUSTER_NAMESPACE` values in the
+below instructions. The default configuration in `common-second-cluster.yaml` is already
+set up to utilize `rook-ceph` for the operator and `rook-ceph-secondary` for the cluster.
+There's no need to run the `sed` command if you prefer to use these default values.
 
 ```console
 cd deploy/examples
+export ROOK_OPERATOR_NAMESPACE="rook-ceph"
+export SECOND_ROOK_CLUSTER_NAMESPACE="rook-ceph-secondary"
 
-NAMESPACE=rook-ceph-secondary envsubst < common-second-cluster.yaml | kubectl create -f -
+sed -i.bak \
+    -e "s/\(.*\):.*# namespace:operator/\1: $ROOK_OPERATOR_NAMESPACE # namespace:operator/g" \
+    -e "s/\(.*\):.*# namespace:cluster/\1: $SECOND_ROOK_CLUSTER_NAMESPACE # namespace:cluster/g" \
+  common-second-cluster.yaml
+
+kubectl create -f common-second-cluster.yaml
 ```
 
 This will create all the necessary RBACs as well as the new namespace. The script assumes that `common.yaml` was already created.
@@ -186,12 +208,13 @@ ceph osd pool set rbd pg_num 512
 
 ## Custom `ceph.conf` Settings
 
-!!! warning
-    The advised method for controlling Ceph configuration is to manually use the Ceph CLI
-    or the Ceph dashboard because this offers the most flexibility. It is highly recommended that this
-    only be used when absolutely necessary and that the `config` be reset to an empty string if/when the
-    configurations are no longer necessary. Configurations in the config file will make the Ceph cluster
-    less configurable from the CLI and dashboard and may make future tuning or debugging difficult.
+!!! info
+    The advised method for controlling Ceph configuration is to use the [`cephConfig`](../../CRDs/Cluster/ceph-cluster-crd.md#ceph-config) and [`cephConfigFromSecret`](../../CRDs/Cluster/ceph-cluster-crd.md#ceph-config-from-secret)
+    in the `CephCluster` CRD.
+    <br><br>It is highly recommended that this only be used when absolutely necessary and that the `config` be
+    reset to an empty string if/when the configurations are no longer necessary. Configurations in the
+    config file will make the Ceph cluster less configurable from the CLI and dashboard and may make
+    future tuning or debugging difficult.
 
 Setting configs via Ceph's CLI requires that at least one mon be available for the configs to be
 set, and setting configs via dashboard requires at least one mgr to be available. Ceph also has
@@ -211,7 +234,7 @@ has been initialized, each daemon will need to be restarted where you want the s
 
 * mons: ensure all three mons are online and healthy before restarting each mon pod, one at a time.
 * mgrs: the pods are stateless and can be restarted as needed, but note that this will disrupt the
-  Ceph dashboard during restart.
+    Ceph dashboard during restart.
 * OSDs: restart your the pods by deleting them, one at a time, and running `ceph -s`
 between each restart to ensure the cluster goes back to "active/clean" state.
 * RGW: the pods are stateless and can be restarted as needed.
@@ -225,6 +248,22 @@ To automate the restart of the Ceph daemon pods, you will need to trigger an upd
 The simplest way to trigger the update is to add [annotations or labels](../../CRDs/Cluster/ceph-cluster-crd.md#annotations-and-labels)
 to the CephCluster CR for the daemons you want to restart. The operator will then proceed with a rolling
 update, similar to any other update to the cluster.
+
+### Node-specific OSD settings
+
+The OSD ceph config settings can also be customized per-node. This may be helpful for some ceph.conf settings that need to be unique per node depending on the hardware. This can be configured by creating a node-specific configmap that will be loaded for all OSDs and OSD prepare jobs on that node, instead of the default settings that are loaded from the rook-config-override configmap.
+
+The node-specific configmaps must have the label:
+
+```yaml
+node.config.rook.io/osd
+```
+
+The configmaps must follow the naming convention:
+
+```yaml
+rook-config-override-<hostname>
+```
 
 ### Example
 
@@ -297,7 +336,7 @@ After the CSI pods are restarted, the new settings should be in effect.
 
 ### Example CSI `ceph.conf` Settings
 
-In this [Example](https://github.com/rook/rook/tree/master/deploy/csi-ceph-conf-override.yaml) we
+In this [Example](https://github.com/rook/rook/tree/master/deploy/examples/csi-ceph-conf-override.yaml) we
 will set the `rbd_validate_pool` to `false` to skip rbd pool validation.
 
 !!! warning
@@ -334,10 +373,10 @@ sizes vary.  This should work for most use-cases, but the following situations
 could warrant weight changes:
 
 * Your cluster has some relatively slow OSDs or nodes. Lowering their weight can
-  reduce the impact of this bottleneck.
+    reduce the impact of this bottleneck.
 * You're using bluestore drives provisioned with Rook v0.3.1 or older.  In this
-  case you may notice OSD weights did not get set relative to their storage
-  capacity.  Changing the weight can fix this and maximize cluster capacity.
+    case you may notice OSD weights did not get set relative to their storage
+    capacity.  Changing the weight can fix this and maximize cluster capacity.
 
 This example sets the weight of osd.0 which is 600GiB
 
@@ -363,12 +402,17 @@ ceph osd primary-affinity osd.0 0
 
 ## OSD Dedicated Network
 
+!!! tip
+    This documentation is left for historical purposes. It is still valid, but Rook offers native
+    support for this feature via the
+    [CephCluster network configuration](../../CRDs/Cluster/ceph-cluster-crd.md#ceph-public-and-cluster-networks).
+
 It is possible to configure ceph to leverage a dedicated network for the OSDs to
-communicate across. A useful overview is the [CEPH Networks](http://docs.ceph.com/docs/master/rados/configuration/network-config-ref/#ceph-networks)
+communicate across. A useful overview is the [Ceph Networks](http://docs.ceph.com/docs/master/rados/configuration/network-config-ref/#ceph-networks)
 section of the Ceph documentation. If you declare a cluster network, OSDs will
-route heartbeat, object replication and recovery traffic over the cluster
+route heartbeat, object replication, and recovery traffic over the cluster
 network. This may improve performance compared to using a single network,
-especially when slower network technologies are used, with the tradeoff of
+especially when slower network technologies are used. The tradeoff is
 additional expense and subtle failure modes.
 
 Two changes are necessary to the configuration to enable this capability:
@@ -404,7 +448,7 @@ apiVersion: v1
 data:
   config: |
     [global]
-    public network =  10.0.7.0/24
+    public network = 10.0.7.0/24
     cluster network = 10.0.10.0/24
     public addr = ""
     cluster addr = ""

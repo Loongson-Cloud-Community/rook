@@ -21,7 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -37,6 +37,7 @@ import (
 	cephobject "github.com/rook/rook/pkg/operator/ceph/object"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,6 +50,7 @@ import (
 )
 
 const (
+	//nolint:gosec // only test values, not a real secret
 	userCreateJSON = `{
 	"user_id": "my-user",
 	"display_name": "my-user",
@@ -67,7 +69,7 @@ const (
 	"caps": [
 		{
 			"type": "users",
-			"perms": "*"
+			"perm": "*"
 		}
 	],
 	"op_mask": "read, write, delete",
@@ -111,8 +113,9 @@ func TestCephObjectStoreUserController(t *testing.T) {
 	cephObjectStore := &cephv1.CephObjectStore{}
 	objectUser := &cephv1.CephObjectStoreUser{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{"cephobjectstoreuser.ceph.rook.io"},
 		},
 		Spec: cephv1.ObjectStoreUserSpec{
 			Store: store,
@@ -279,7 +282,8 @@ func TestCephObjectStoreUserController(t *testing.T) {
 		rgwPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 			Name:      "rook-ceph-rgw-my-store-a-5fd6fb4489-xv65v",
 			Namespace: namespace,
-			Labels:    map[string]string{k8sutil.AppAttr: appName, "rgw": "my-store"}}}
+			Labels:    map[string]string{k8sutil.AppAttr: appName, "rgw": "my-store"},
+		}}
 
 		// Get the updated object.
 		// Create RGW pod
@@ -295,7 +299,13 @@ func TestCephObjectStoreUserController(t *testing.T) {
 						(req.URL.RawQuery == "format=json&uid=my-user" && req.Method == http.MethodGet && req.URL.Path == "rook-ceph-rgw-my-store.mycluster.svc/admin/user") {
 						return &http.Response{
 							StatusCode: 200,
-							Body:       ioutil.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+							Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+						}, nil
+					}
+					if req.Method == http.MethodDelete && req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3D%2A%3B" {
+						return &http.Response{
+							StatusCode: 200,
+							Body:       io.NopCloser(bytes.NewReader([]byte(`[]`))),
 						}, nil
 					}
 					return nil, fmt.Errorf("unexpected request: %q. method %q. path %q", req.URL.RawQuery, req.Method, req.URL.Path)
@@ -310,7 +320,7 @@ func TestCephObjectStoreUserController(t *testing.T) {
 			return &cephobject.AdminOpsContext{
 				Context:               *context,
 				AdminOpsUserAccessKey: "53S6B9S809NUP19IJ2K3",
-				AdminOpsUserSecretKey: "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR",
+				AdminOpsUserSecretKey: "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", // notsecret
 				AdminOpsClient:        adminClient,
 			}, nil
 		}
@@ -322,6 +332,74 @@ func TestCephObjectStoreUserController(t *testing.T) {
 		err = r.client.Get(context.TODO(), req.NamespacedName, objectUser)
 		assert.NoError(t, err)
 		assert.Equal(t, "Ready", objectUser.Status.Phase, objectUser)
+	})
+
+	t.Run("cluster and object store in different namespace", func(t *testing.T) {
+		cephCluster = &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      namespace,
+				Namespace: namespace,
+			},
+			Status: cephv1.ClusterStatus{
+				Phase: k8sutil.ReadyStatus,
+				CephStatus: &cephv1.CephStatus{
+					Health: "HEALTH_OK",
+				},
+			},
+		}
+		cephObjectStore.Spec.AllowUsersInNamespaces = []string{"*"}
+
+		// Create a fake client to mock API calls.
+		objectUser.Spec.ClusterNamespace = namespace
+		objectUser.Namespace = "foo"
+		req.Namespace = "foo"
+		object = []runtime.Object{cephObjectStore, objectUser, cephCluster}
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+		rgwPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      "rook-ceph-rgw-my-store-a-5fd6fb4489-xv65v",
+			Namespace: namespace,
+			Labels:    map[string]string{k8sutil.AppAttr: appName, "rgw": "my-store"},
+		}}
+
+		// Create a user in a different namespace, and where the cephcluster does exist
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: record.NewFakeRecorder(5)}
+		err := r.client.Create(context.TODO(), rgwPod)
+		assert.NoError(t, err)
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+
+		// Disallow creating a user in a different namespace
+		cephObjectStore.Spec.AllowUsersInNamespaces = []string{}
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: record.NewFakeRecorder(5)}
+		res, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+
+		objectUser.Spec.ClusterNamespace = ""
+		object = []runtime.Object{objectUser, cephCluster}
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+		// Create a user in a different namespace, but where the cephcluster doesn't exist
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: record.NewFakeRecorder(5)}
+		res, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+
+		req.Namespace = namespace
+		objectUser.Namespace = namespace
+	})
+
+	t.Run("users allowed in other namespace", func(t *testing.T) {
+		assert.False(t, userInNamespaceAllowed("foo", []string{}))
+		assert.False(t, userInNamespaceAllowed("foo", []string{"bar"}))
+		assert.False(t, userInNamespaceAllowed("foo", []string{"bar", "baz"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"*"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"bar", "*"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"foo"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"bar", "foo"}))
 	})
 }
 
@@ -366,7 +444,7 @@ func TestCreateOrUpdateCephUser(t *testing.T) {
 				if req.URL.RawQuery == "format=json&uid=my-user" {
 					return &http.Response{
 						StatusCode: 200,
-						Body:       ioutil.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
 					}, nil
 				}
 			}
@@ -378,7 +456,7 @@ func TestCreateOrUpdateCephUser(t *testing.T) {
 					req.URL.RawQuery == "display-name=my-user&format=json&max-buckets=200&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dread%3B" {
 					return &http.Response{
 						StatusCode: 200,
-						Body:       ioutil.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
 					}, nil
 				}
 			}
@@ -387,23 +465,30 @@ func TestCreateOrUpdateCephUser(t *testing.T) {
 				if req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dread%3B" {
 					return &http.Response{
 						StatusCode: 200,
-						Body:       ioutil.NopCloser(bytes.NewReader([]byte(`[]`))),
+						Body:       io.NopCloser(bytes.NewReader([]byte(`[]`))),
+					}, nil
+				}
+				if req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3D%2A%3B" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(`[]`))),
 					}, nil
 				}
 			}
 			if req.Method == http.MethodPut {
-				if req.URL.RawQuery == "enabled=false&format=json&max-objects=-1&max-size=-1&quota=&quota-type=user&uid=my-user" ||
-					req.URL.RawQuery == "enabled=true&format=json&max-objects=10000&max-size=-1&quota=&quota-type=user&uid=my-user" ||
-					req.URL.RawQuery == "enabled=true&format=json&max-objects=-1&max-size=10000000000&quota=&quota-type=user&uid=my-user" ||
-					req.URL.RawQuery == "enabled=true&format=json&max-objects=10000&max-size=10000000000&quota=&quota-type=user&uid=my-user" {
+				switch req.URL.RawQuery {
+				case "enabled=false&format=json&max-objects=-1&max-size=-1&quota=&quota-type=user&uid=my-user",
+					"enabled=true&format=json&max-objects=10000&max-size=-1&quota=&quota-type=user&uid=my-user",
+					"enabled=true&format=json&max-objects=-1&max-size=10000000000&quota=&quota-type=user&uid=my-user",
+					"enabled=true&format=json&max-objects=10000&max-size=10000000000&quota=&quota-type=user&uid=my-user":
 					return &http.Response{
 						StatusCode: 200,
-						Body:       ioutil.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
 					}, nil
-				} else if req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dread%3B" {
+				case "caps=&format=json&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dwrite%3Broles%3D%2A%3Binfo%3Dread%2C%20write%3B":
 					return &http.Response{
 						StatusCode: 200,
-						Body:       ioutil.NopCloser(bytes.NewReader([]byte(userCapsJSON))),
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCapsJSON))),
 					}, nil
 				}
 			}
@@ -413,35 +498,32 @@ func TestCreateOrUpdateCephUser(t *testing.T) {
 	}
 	adminClient, err := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
 	assert.NoError(t, err)
-	userConfig := generateUserConfig(objectUser)
 	r := &ReconcileObjectStoreUser{
 		objContext: &cephobject.AdminOpsContext{
 			AdminOpsClient: adminClient,
 		},
-		userConfig:       &userConfig,
 		opManagerContext: context.TODO(),
 	}
 	maxsize, err := resource.ParseQuantity(maxsizestr)
 	assert.NoError(t, err)
 
 	t.Run("user with empty name", func(t *testing.T) {
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := &admin.User{}
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.Error(t, err)
 	})
 
 	t.Run("user without any Quotas or Capabilities", func(t *testing.T) {
 		objectUser.Name = name
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 
 	t.Run("setting MaxBuckets for the user", func(t *testing.T) {
 		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxBuckets: &maxbucket}
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 
@@ -449,11 +531,12 @@ func TestCreateOrUpdateCephUser(t *testing.T) {
 		objectUser.Spec.Quotas = nil
 		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
 			User:   "read",
-			Bucket: "read",
+			Bucket: "write",
+			Roles:  "*",
+			Info:   "read, write",
 		}
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 
@@ -461,49 +544,51 @@ func TestCreateOrUpdateCephUser(t *testing.T) {
 	t.Run("setting MaxObjects for the user", func(t *testing.T) {
 		objectUser.Spec.Capabilities = nil
 		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxObjects: &maxobject}
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		require.NoError(t, err)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 	t.Run("setting MaxSize for the user", func(t *testing.T) {
 		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxSize: &maxsize}
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		require.NoError(t, err)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 	t.Run("resetting MaxSize and MaxObjects for the user", func(t *testing.T) {
 		objectUser.Spec.Quotas = nil
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		require.NoError(t, err)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 	t.Run("setting both MaxSize and MaxObjects for the user", func(t *testing.T) {
 		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxObjects: &maxobject, MaxSize: &maxsize}
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		require.NoError(t, err)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 	t.Run("resetting MaxSize and MaxObjects again for the user", func(t *testing.T) {
 		objectUser.Spec.Quotas = nil
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		require.NoError(t, err)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 
 	t.Run("setting both Quotas and Capabilities for the user", func(t *testing.T) {
 		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
 			User:   "read",
-			Bucket: "read",
+			Bucket: "write",
+			Roles:  "*",
+			Info:   "read, write",
 		}
 		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxBuckets: &maxbucket, MaxObjects: &maxobject, MaxSize: &maxsize}
-		userConfig = generateUserConfig(objectUser)
-		r.userConfig = &userConfig
-		err = r.createOrUpdateCephUser(objectUser)
+		userConfig := generateUserConfig(objectUser)
+		require.NoError(t, err)
+		err = r.createOrUpdateCephUser(objectUser, userConfig)
 		assert.NoError(t, err)
 	})
 }

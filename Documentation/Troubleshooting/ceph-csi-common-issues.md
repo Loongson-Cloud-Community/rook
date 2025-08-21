@@ -110,7 +110,7 @@ to exist in the toolbox:
 
 ```console
 $ ceph osd lspools
-1 device_health_metrics
+1 .mgr
 2 replicapool
 ```
 
@@ -132,7 +132,7 @@ Now verify the `pool` mentioned in the `storageclass.yaml` exists, such as the e
 
 ```console
 ceph osd lspools
-1 device_health_metrics
+1 .mgr
 2 replicapool
 3 myfs-metadata0
 4 myfs-data0
@@ -255,8 +255,8 @@ When a user requests to create the application pod with PVC, there is a three-st
 ### csi-driver registration
 
 `csi-cephfsplugin-xxxx` or `csi-rbdplugin-xxxx` is a daemonset pod running on all the nodes
- where your application gets scheduled. If the plugin pods are not running on the node where
- your application is scheduled might cause the issue, make sure plugin pods are always running.
+where your application gets scheduled. If the plugin pods are not running on the node where
+your application is scheduled might cause the issue, make sure plugin pods are always running.
 
 Each plugin pod has two important containers: one is `driver-registrar` and `csi-rbdplugin` or
 `csi-cephfsplugin`. Sometimes there is also a `liveness-prometheus` container.
@@ -412,8 +412,6 @@ Where `-m` is one of the mon endpoints and the `--key` is the key used by the CS
 ## Node Loss
 
 When a node is lost, you will see application pods on the node stuck in the `Terminating` state while another pod is rescheduled and is in the `ContainerCreating` state.
-
-To allow the application pod to start on another node, force delete the pod.
 
 ### Force deleting the pod
 

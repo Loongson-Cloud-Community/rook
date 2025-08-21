@@ -33,7 +33,7 @@ import (
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,9 +43,10 @@ import (
 )
 
 var (
-	name           = "topic-a"
-	namespace      = "rook-ceph"
-	store          = "test-store"
+	name      = "topic-a"
+	namespace = "rook-ceph"
+	store     = "test-store"
+	//nolint:gosec // only test values, not a real secret
 	userCreateJSON = `{
 		"user_id": "rgw-admin-ops-user",
 		"display_name": "RGW Admin Ops User",
@@ -70,8 +71,9 @@ func TestCephBucketTopicController(t *testing.T) {
 
 	bucketTopic := &cephv1.CephBucketTopic{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{"cephbuckettopic.ceph.rook.io"},
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind: "CephBucketTopic",
@@ -191,7 +193,7 @@ func TestCephBucketTopicController(t *testing.T) {
 			"mon-secret":   []byte("monsecret"),
 			"admin-secret": []byte("adminsecret"),
 		}
-		secret := &v1.Secret{
+		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "rook-ceph-mon",
 				Namespace: namespace,
@@ -213,7 +215,8 @@ func TestCephBucketTopicController(t *testing.T) {
 				Namespace: namespace,
 			},
 			TypeMeta: metav1.TypeMeta{
-				Kind: "CephObjectStore"},
+				Kind: "CephObjectStore",
+			},
 			Spec: cephv1.ObjectStoreSpec{
 				Gateway: cephv1.GatewaySpec{
 					Port: int32(80),
@@ -230,8 +233,8 @@ func TestCephBucketTopicController(t *testing.T) {
 
 		// mock the provisioner
 		expectedARN := "arn:aws:sns:" + store + "::" + bucketTopic.Name
-		createTopicFunc = func(p provisioner, topic *cephv1.CephBucketTopic) (*string, error) {
-			return &expectedARN, nil
+		createTopicFunc = func(p provisioner, topic *cephv1.CephBucketTopic) (*string, *map[types.UID]*corev1.Secret, error) {
+			return &expectedARN, nil, nil
 		}
 		defer func() { createTopicFunc = createTopic }()
 		res, err := r.Reconcile(ctx, req)

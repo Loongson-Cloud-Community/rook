@@ -33,7 +33,6 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	oposd "github.com/rook/rook/pkg/operator/ceph/cluster/osd"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/util/sys"
 )
 
@@ -45,16 +44,13 @@ const (
 	bluestoreSignature    = "bluestore block device"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "cephosd")
-)
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "cephosd")
 
 // StartOSD starts an OSD on a device that was provisioned by ceph-volume
 func StartOSD(context *clusterd.Context, osdType, osdID, osdUUID, lvPath string, pvcBackedOSD, lvBackedPV bool, cephArgs []string) error {
-
 	// ensure the config mount point exists
 	configDir := fmt.Sprintf("/var/lib/ceph/osd/ceph-%s", osdID)
-	err := os.Mkdir(configDir, 0750)
+	err := os.Mkdir(configDir, 0o750)
 	if err != nil {
 		logger.Errorf("failed to create config dir %q. %v", configDir, err)
 	}
@@ -120,7 +116,6 @@ func handleTerminate(context *clusterd.Context, lvPath, volumeGroupName string) 
 }
 
 func killCephOSDProcess(context *clusterd.Context, lvPath string) error {
-
 	pid, err := context.Executor.ExecuteCommandWithOutput("fuser", "-a", lvPath)
 	if err != nil {
 		return errors.Wrapf(err, "failed to retrieve process ID for %q", lvPath)
@@ -161,7 +156,7 @@ func configRawDevice(name string, context *clusterd.Context) (*sys.LocalDisk, er
 }
 
 // Provision provisions an OSD
-func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topologyAffinity string) error {
+func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topologyAffinity, deviceFilter, metaDevice string) error {
 	if agent.pvcBacked && os.Getenv(oposd.EncryptedDeviceEnvVarName) == "true" {
 		logger.Debug("encryption configuration detecting, populating kek to an env variable")
 		// Init KMS store, retrieve the KEK and store it as an env var for ceph-volume
@@ -181,10 +176,6 @@ func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topolo
 	status := oposd.OrchestrationStatus{Status: oposd.OrchestrationStatusOrchestrating}
 	oposd.UpdateNodeOrPVCStatus(agent.clusterInfo.Context, agent.kv, agent.nodeName, status)
 
-	if err := client.WriteCephConfig(context, agent.clusterInfo); err != nil {
-		return errors.Wrap(err, "failed to generate ceph config")
-	}
-
 	logger.Infof("discovering hardware")
 
 	var rawDevices []*sys.LocalDisk
@@ -202,13 +193,22 @@ func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topolo
 		// Ideally, we would use the "ceph-volume inventory" command instead
 		// However, it suffers from some limitation such as exposing available partitions and LVs
 		// See: https://tracker.ceph.com/issues/43579
-		rawDevices, err = clusterd.DiscoverDevices(context.Executor)
+		rawDevices, err = clusterd.DiscoverDevicesWithFilter(context.Executor, deviceFilter, metaDevice)
 		if err != nil {
 			return errors.Wrap(err, "failed initial hardware discovery")
 		}
 	}
 
 	context.Devices = rawDevices
+
+	// Wipe the desired OSD disks in case they belong to a different ceph cluster.
+	if agent.wipeDevicesFromOtherClusters {
+		logger.Info("checking for OSD disks from a different cluster")
+		err := agent.WipeDevicesFromOtherClusters(context)
+		if err != nil {
+			return errors.Wrapf(err, "failed to wipe devices from other clusters")
+		}
+	}
 
 	logger.Info("creating and starting the osds")
 
@@ -371,6 +371,7 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 				// This handles the case where the OSD deployment has been removed and the prepare
 				// job kicks in again to re-deploy the OSD.
 				continue
+
 			} else if device.Filesystem == "mpath_member" && agent.pvcBacked {
 				logger.Infof("allowing multipath disk %q with filesystem %q", device.Name, device.Filesystem)
 			} else {
@@ -394,13 +395,6 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			device, err := clusterd.PopulateDeviceUdevInfo(device.Name, context.Executor, device)
 			if err != nil {
 				logger.Errorf("failed to get udev info of partition %q. %v", device.Name, err)
-				continue
-			}
-		}
-
-		if device.Type == sys.LoopType {
-			if !agent.clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 17, Minor: 2, Extra: 4}) {
-				logger.Infof("partition %q is not picked because loop devices are not allowed on Ceph clusters older than v17.2.4", device.Name)
 				continue
 			}
 		}
@@ -531,19 +525,7 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 
 				if matched {
 					matchedDevice = desiredDevice
-					if matchedDevice.DeviceClass == "" {
-						classNotSet := true
-						if agent.pvcBacked {
-							crushDeviceClass := os.Getenv(oposd.CrushDeviceClassVarName)
-							if crushDeviceClass != "" {
-								matchedDevice.DeviceClass = crushDeviceClass
-								classNotSet = false
-							}
-						}
-						if classNotSet {
-							matchedDevice.DeviceClass = sys.GetDiskDeviceClass(device)
-						}
-					}
+					matchedDevice.UpdateDeviceClass(agent, device)
 					break
 				}
 			}
@@ -577,11 +559,12 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			// It is particularly useful when a metadata PVC is used because we need to identify it in the map
 			// So the entry must be named "metadata" so it can accessed later
 			if agent.pvcBacked {
-				if device.Type == pvcDataTypeDevice {
+				switch device.Type {
+				case pvcDataTypeDevice:
 					available.Entries[pvcDataTypeDevice] = deviceInfo
-				} else if device.Type == pvcMetadataTypeDevice {
+				case pvcMetadataTypeDevice:
 					available.Entries[pvcMetadataTypeDevice] = deviceInfo
-				} else if device.Type == pvcWalTypeDevice {
+				case pvcWalTypeDevice:
 					available.Entries[pvcWalTypeDevice] = deviceInfo
 				}
 			} else {
@@ -612,4 +595,33 @@ func getVolumeGroupName(lvPath string) string {
 	}
 
 	return vgSlice[2]
+}
+
+// GetOSDInfoById returns the osdInfo using the ceph volume list
+func GetOSDInfoById(context *clusterd.Context, clusterInfo *client.ClusterInfo, osdID int) (*oposd.OSDInfo, error) {
+	// LVM mode OSDs
+	osdLVMList, err := GetCephVolumeLVMOSDs(context, clusterInfo, clusterInfo.FSID, "", false, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list lvm osd(s)")
+	}
+
+	for _, osdInfo := range osdLVMList {
+		if osdInfo.ID == osdID {
+			return &osdInfo, nil
+		}
+	}
+
+	// Raw mode OSDs
+	osdRawList, err := GetCephVolumeRawOSDs(context, clusterInfo, clusterInfo.FSID, "", "", "", false, true)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list raw osd(s)")
+	}
+
+	for _, osdInfo := range osdRawList {
+		if osdInfo.ID == osdID {
+			return &osdInfo, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to get details for OSD %d using ceph-volume list", osdID)
 }

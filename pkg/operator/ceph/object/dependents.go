@@ -30,7 +30,6 @@ import (
 const (
 	bucketDependentType                = "buckets in the object store (could be from ObjectBucketClaims or COSI Buckets)"
 	zoneIsMasterWithPeersDependentType = "zone is master and has peers"
-	s3HealthCheckBucketName            = "rook-ceph-bucket-checker"
 )
 
 // CephObjectStoreDependents returns the buckets which exist in the object store that should block
@@ -52,7 +51,7 @@ func CephObjectStoreDependents(
 		// stores in multisite configs have different conditions that change what dependents should be checked
 		zoneIsMaster, err := CheckZoneIsMaster(objCtx)
 		if err != nil {
-			return deps, errors.Wrapf(err, baseErrMsg)
+			return deps, errors.Wrapf(err, "%s", baseErrMsg)
 		}
 		if !zoneIsMaster {
 			// zone is a peer, and the master is the source of truth
@@ -80,7 +79,7 @@ func CephObjectStoreDependents(
 	// way of knowing if the bucket was created due to an ObjectBucketClaim or COSI Bucket.
 	err := getBucketDependents(deps, clusterdCtx, clusterInfo, store, objCtx, opsCtx)
 	if err != nil {
-		return deps, errors.Wrapf(err, baseErrMsg)
+		return deps, errors.Wrapf(err, "%s", baseErrMsg)
 	}
 
 	// CephObjectStoreUsers
@@ -161,8 +160,4 @@ func getMasterZoneDependents(
 		}
 	}
 	return nil
-}
-
-func genHealthCheckerBucketName(uuid string) string {
-	return fmt.Sprintf("%s-%s", s3HealthCheckBucketName, uuid)
 }

@@ -24,7 +24,7 @@ import (
 
 const (
 	// The version from which the upgrade test will start
-	Version1_9 = "v1.9.10"
+	Version1_17 = "v1.17.7"
 )
 
 // CephManifestsPreviousVersion wraps rook yaml definitions
@@ -43,6 +43,10 @@ func (m *CephManifestsPreviousVersion) GetCRDs(k8shelper *utils.K8sHelper) strin
 
 func (m *CephManifestsPreviousVersion) GetCSINFSRBAC() string {
 	return m.settings.readManifestFromGitHub("/csi/nfs/rbac.yaml")
+}
+
+func (m *CephManifestsPreviousVersion) GetCSIOperator() string {
+	return "not-supported"
 }
 
 // GetRookOperator returns rook Operator manifest
@@ -131,8 +135,11 @@ func (m *CephManifestsPreviousVersion) GetNFSPool() string {
 	return m.latest.GetNFSPool()
 }
 
-func (m *CephManifestsPreviousVersion) GetObjectStore(name string, replicaCount, port int, tlsEnable bool) string {
-	return m.latest.GetObjectStore(name, replicaCount, port, tlsEnable)
+func (m *CephManifestsPreviousVersion) GetObjectStore(name string, replicaCount, port int, tlsEnable bool, swiftAndKeystone bool) string {
+	if swiftAndKeystone {
+		panic("Previous version does not support swift or keystone")
+	}
+	return m.latest.GetObjectStore(name, replicaCount, port, tlsEnable, false)
 }
 
 func (m *CephManifestsPreviousVersion) GetObjectStoreUser(name, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) string {
@@ -179,4 +186,16 @@ func (m *CephManifestsPreviousVersion) GetRBDMirror(name string, count int) stri
 
 func (m *CephManifestsPreviousVersion) GetFilesystemSubvolumeGroup(fsName, groupName string) string {
 	return m.latest.GetFilesystemSubvolumeGroup(fsName, groupName)
+}
+
+func (m *CephManifestsPreviousVersion) GetCOSIDriver() string {
+	return m.latest.GetCOSIDriver()
+}
+
+func (m *CephManifestsPreviousVersion) GetBucketClass(name, objectStoreUserSecretName, deletionPolicy string) string {
+	return m.latest.GetBucketClass(name, objectStoreUserSecretName, deletionPolicy)
+}
+
+func (m *CephManifestsPreviousVersion) GetBucketClaim(name, bucketClassName string) string {
+	return m.latest.GetBucketClaim(name, bucketClassName)
 }

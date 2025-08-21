@@ -26,9 +26,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-flags")
-)
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-flags")
 
 func VerifyRequiredFlags(cmd *cobra.Command, requiredFlags []string) error {
 	var missingFlags []string
@@ -58,7 +56,7 @@ func SetFlagsFromEnv(flags *pflag.FlagSet, prefix string) {
 	var errorFlag bool
 	var err error
 	flags.VisitAll(func(f *pflag.Flag) {
-		envVar := prefix + "_" + strings.Replace(strings.ToUpper(f.Name), "-", "_", -1)
+		envVar := prefix + "_" + strings.ReplaceAll(strings.ToUpper(f.Name), "-", "_")
 		value := os.Getenv(envVar)
 		if value != "" {
 			// Set the environment variable. Will override default values, but be overridden by command line parameters.

@@ -167,7 +167,9 @@ function deploy_vault {
 }
 
 function validate_rgw_token {
-  RGW_POD=$(kubectl -n rook-ceph get pods -l app=rook-ceph-rgw | awk 'FNR == 2 {print $1}')
+  echo "wait for rgw pod to be ready"
+  kubectl wait --for=condition=ready pod -l app=rook-ceph-rgw -n rook-ceph --timeout=100s
+  RGW_POD=$(kubectl get pods -l app=rook-ceph-rgw -n rook-ceph --no-headers -o custom-columns=":metadata.name")
   RGW_TOKEN_FILE=$(kubectl -n rook-ceph describe pods "$RGW_POD" | grep "rgw-crypt-vault-token-file" | cut -f2- -d=)
   VAULT_PATH_PREFIX=$(kubectl -n rook-ceph describe pods "$RGW_POD" | grep "rgw-crypt-vault-prefix" | cut -f2- -d=)
   VAULT_TOKEN=$(kubectl -n rook-ceph exec $RGW_POD -- cat $RGW_TOKEN_FILE)
@@ -274,6 +276,32 @@ function validate_osd_secret {
   fi
 }
 
+function validate_key_rotation() {
+  local backend_path=$1
+  pvc_name=$(kubectl get pvc -n rook-ceph -l ceph.rook.io/setIndex=0 -o jsonpath='{.items[0].metadata.name}')
+  key_name="rook-ceph-osd-encryption-key-$pvc_name"
+  cmd="vault kv get -format=json $backend_path/$key_name"
+  old_key=$(kubectl exec vault-0 -- sh -c "$cmd" | jq -r ".data.\"$key_name\"")
+  local new_key
+  runtime=180
+  endtime=$((SECONDS + runtime))
+  while [ $SECONDS -le $endtime ]; do
+    echo "Time Now: $(date +%H:%M:%S)"
+    new_key=$(kubectl exec vault-0 -- sh -c "$cmd" | jq -r ".data.\"$key_name\"")
+
+    if [ "$old_key" != "$new_key" ]; then
+      echo "encryption passphrase is successfully rotated"
+      exit 0
+    fi
+
+    echo "encryption passphrase is not rotated, sleeping for 10 seconds"
+    sleep 10
+  done
+
+  echo "encryption passphrase is not rotated"
+  exit 1
+}
+
 ########
 # MAIN #
 ########
@@ -287,6 +315,9 @@ validate_osd)
   ;;
 validate_rgw)
   validate_rgw_deployment
+  ;;
+validate_key_rotation)
+  validate_key_rotation "$2"
   ;;
 *)
   echo "invalid action $ACTION" >&2

@@ -24,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ceph/go-ceph/rgw/admin"
 	"github.com/coreos/pkg/capnslog"
 	bktclient "github.com/kube-object-storage/lib-bucket-provisioner/pkg/client/clientset/versioned"
 	"github.com/pkg/errors"
@@ -32,6 +31,7 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"github.com/rook/rook/pkg/operator/k8sutil"
@@ -45,14 +45,19 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
 	controllerName = "ceph-object-controller"
+	// DisableOBCEnvVar environment variable, if set to "true", will skip watching Object Bucket and Notification resources.
+	// This variable can be added to container spec of the `rook-ceph-operator` deployment.
+	DisableOBCEnvVar = "ROOK_DISABLE_OBJECT_BUCKET_CLAIM"
 )
 
 var waitForRequeueIfObjectStoreNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
@@ -112,6 +117,21 @@ func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerCont
 	}
 }
 
+func watchOwnedCoreObject[T client.Object](c controller.Controller, mgr manager.Manager, obj T) error {
+	return c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			obj,
+			handler.TypedEnqueueRequestForOwner[T](
+				mgr.GetScheme(),
+				mgr.GetRESTMapper(),
+				&cephv1.CephObjectStore{},
+			),
+			opcontroller.WatchPredicateForNonCRDObject[T](&cephv1.CephObjectStore{TypeMeta: controllerTypeMeta}, mgr.GetScheme()),
+		),
+	)
+}
+
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
@@ -121,23 +141,127 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	logger.Info("successfully started")
 
 	// Watch for changes on the cephObjectStore CRD object
-	err = c.Watch(&source.Kind{Type: &cephv1.CephObjectStore{TypeMeta: controllerTypeMeta}}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephObjectStore{TypeMeta: controllerTypeMeta},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephObjectStore]{},
+			opcontroller.WatchControllerPredicate[*cephv1.CephObjectStore](mgr.GetScheme()),
+		),
+	)
 	if err != nil {
 		return err
 	}
 
 	// Watch all other resources
 	for _, t := range objectsToWatch {
-		err = c.Watch(&source.Kind{Type: t}, &handler.EnqueueRequestForOwner{
-			IsController: true,
-			OwnerType:    &cephv1.CephObjectStore{},
-		}, opcontroller.WatchPredicateForNonCRDObject(&cephv1.CephObjectStore{TypeMeta: controllerTypeMeta}, mgr.GetScheme()))
+		err = watchOwnedCoreObject(c, mgr, t)
 		if err != nil {
 			return err
 		}
 	}
 
+	// Watch Secrets secrets annotated for the object store
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&corev1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: corev1.SchemeGroupVersion.String()}},
+			handler.TypedEnqueueRequestsFromMapFunc(mapSecretToCR(mgr.GetClient())),
+			secretPredicate(),
+		),
+	)
+	if err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// Watch all secrets not owned by Rook
+func secretPredicate[T *corev1.Secret]() predicate.TypedPredicate[T] {
+	rookGV := cephv1.SchemeGroupVersion.String()
+	return predicate.TypedFuncs[T]{
+		UpdateFunc: func(e event.TypedUpdateEvent[T]) bool {
+			secret := (*corev1.Secret)(e.ObjectNew)
+
+			// check if secret already owned by Rook:
+			for _, owner := range secret.OwnerReferences {
+				if owner.APIVersion == rookGV {
+					// already owned by Rook CR
+					return false
+				}
+			}
+			return true
+		},
+		CreateFunc: func(e event.TypedCreateEvent[T]) bool {
+			secret := (*corev1.Secret)(e.Object)
+
+			// check if secret already owned by Rook:
+			for _, owner := range secret.OwnerReferences {
+				if owner.APIVersion == rookGV {
+					// already owned by Rook CR
+					return false
+				}
+			}
+			return true
+		},
+		DeleteFunc: func(e event.TypedDeleteEvent[T]) bool {
+			secret := (*corev1.Secret)(e.Object)
+			// check if secret already owned by Rook:
+			for _, owner := range secret.OwnerReferences {
+				if owner.APIVersion == rookGV {
+					// already owned by Rook CR
+					return false
+				}
+			}
+			return true
+		},
+	}
+}
+
+// Maps secret referenced by object store to the object store CR
+func mapSecretToCR(k8sClient client.Client) handler.TypedMapFunc[*corev1.Secret, reconcile.Request] {
+	return func(ctx context.Context, secret *corev1.Secret) []reconcile.Request {
+		// lookup object store CRs by name
+		objStores := cephv1.CephObjectStoreList{}
+		err := k8sClient.List(ctx, &objStores, client.InNamespace(secret.Namespace))
+		if err != nil {
+			if kerrors.IsNotFound(err) {
+				logger.Debugf("cephObjectStore resource for referenced secret %q not found. Ignoring since object must be deleted.", secret.Name)
+				return nil
+			}
+			logger.Errorf("failed to list cephObjectStore resources for referenced secret %q", secret.Name)
+			return nil
+		}
+
+		var requests []reconcile.Request
+		for _, objStore := range objStores.Items {
+			// reconcile ObjectStore if it refers to the secret
+			if isObjStoreSpecContainsSecret(&objStore.Spec, secret) {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      objStore.Name,
+						Namespace: objStore.Namespace,
+					},
+				})
+			}
+		}
+		return requests
+	}
+}
+
+func isObjStoreSpecContainsSecret(spec *cephv1.ObjectStoreSpec, secret *corev1.Secret) bool {
+	// check if secret is referred in object store rgwConfigFromSecret:
+	for _, sec := range spec.Gateway.RgwConfigFromSecret {
+		if sec.Name == secret.Name {
+			return true
+		}
+	}
+	// check if secret is referred in object store keystone service user secret:
+	if spec.Auth.Keystone != nil && spec.Auth.Keystone.ServiceUserSecretName == secret.Name {
+		return true
+	}
+	return false
 }
 
 // Reconcile reads that state of the cluster for a cephObjectStore object and makes changes based on the state read
@@ -145,6 +269,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCephObjectStore) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, objectStore, err := r.reconcile(request)
 
@@ -170,17 +295,34 @@ func (r *ReconcileCephObjectStore) reconcile(request reconcile.Request) (reconci
 	observedGeneration := cephObjectStore.ObjectMeta.Generation
 
 	// Set a finalizer so we can do cleanup before the object goes away
-	err = opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephObjectStore)
+	generationUpdated, err := opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephObjectStore)
 	if err != nil {
 		return reconcile.Result{}, *cephObjectStore, errors.Wrap(err, "failed to add finalizer")
+	}
+	if generationUpdated {
+		logger.Infof("reconciling the object store %q after adding finalizer", cephObjectStore.Name)
+		return reconcile.Result{}, *cephObjectStore, nil
 	}
 
 	// The CR was just created, initializing status fields
 	if cephObjectStore.Status == nil {
 		// The store is not available so let's not build the status Info yet
-		updateStatus(r.opManagerContext, k8sutil.ObservedGenerationNotAvailable, r.client, request.NamespacedName, cephv1.ConditionProgressing, map[string]string{})
+		cephxUninitialized := keyring.UninitializedCephxStatus()
+		err := updateStatus(r.opManagerContext, k8sutil.ObservedGenerationNotAvailable, r.client, request.NamespacedName, cephv1.ConditionProgressing, map[string]string{}, &cephxUninitialized)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to initialize status and cephx status for cephObjectStore %q", request.NamespacedName)
+		}
+		cephObjectStore.Status = &cephv1.ObjectStoreStatus{
+			Cephx: cephv1.LocalCephxStatus{
+				Daemon: cephxUninitialized,
+			},
+		}
 	} else {
-		updateStatus(r.opManagerContext, k8sutil.ObservedGenerationNotAvailable, r.client, request.NamespacedName, cephv1.ConditionProgressing, buildStatusInfo(cephObjectStore))
+		var nilCephxStatus *cephv1.CephxStatus = nil // leave cephx status as-is
+		err := updateStatus(r.opManagerContext, k8sutil.ObservedGenerationNotAvailable, r.client, request.NamespacedName, cephv1.ConditionProgressing, buildStatusInfo(cephObjectStore), nilCephxStatus)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to initialize cephx status for cephObjectStore %q", request.NamespacedName)
+		}
 	}
 
 	// Make sure a CephCluster is present otherwise do nothing
@@ -215,7 +357,10 @@ func (r *ReconcileCephObjectStore) reconcile(request reconcile.Request) (reconci
 
 	// DELETE: the CR was deleted
 	if !cephObjectStore.GetDeletionTimestamp().IsZero() {
-		updateStatus(r.opManagerContext, k8sutil.ObservedGenerationNotAvailable, r.client, request.NamespacedName, cephv1.ConditionDeleting, buildStatusInfo(cephObjectStore))
+		err := updateStatus(r.opManagerContext, k8sutil.ObservedGenerationNotAvailable, r.client, request.NamespacedName, cephv1.ConditionDeleting, buildStatusInfo(cephObjectStore), nil)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to set deleting status for cephObjectStore %q", request.NamespacedName)
+		}
 
 		// Detect running Ceph version
 		runningCephVersion, err := cephclient.LeastUptodateDaemonVersion(r.context, r.clusterInfo, config.MonType)
@@ -238,12 +383,6 @@ func (r *ReconcileCephObjectStore) reconcile(request reconcile.Request) (reconci
 		if err != nil {
 			return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to get admin ops API context")
 		}
-
-		// ignore any errors coming from this for the deletion case since we could get into a
-		// partially-deleted case where RGWs aren't responding. Deletion will be blocked later if
-		// the bucket fails to be deleted and the RGWs are running.
-		_ = removeDeprecatedHealthCheckBucket(r.clusterInfo.Context, opsCtx, cephObjectStore)
-
 		deps, err := cephObjectStoreDependents(r.context, r.clusterInfo, cephObjectStore, objCtx, opsCtx)
 		if err != nil {
 			return reconcile.Result{}, *cephObjectStore, err
@@ -272,6 +411,7 @@ func (r *ReconcileCephObjectStore) reconcile(request reconcile.Request) (reconci
 		return reconcile.Result{}, *cephObjectStore, nil
 	}
 
+	shouldRotateCephxKeys := false
 	if cephObjectStore.Spec.IsExternal() {
 		// Check the ceph version of the running monitors
 		desiredCephVersion, err := cephclient.LeastUptodateDaemonVersion(r.context, r.clusterInfo, config.MonType)
@@ -309,7 +449,16 @@ func (r *ReconcileCephObjectStore) reconcile(request reconcile.Request) (reconci
 				*cephObjectStore,
 				opcontroller.ErrorCephUpgradingRequeue(desiredCephVersion, runningCephVersion)
 		}
-		r.clusterInfo.CephVersion = *desiredCephVersion
+		r.clusterInfo.CephVersion = *runningCephVersion
+
+		shouldRotateCephxKeys, err = keyring.ShouldRotateCephxKeys(
+			cephCluster.Spec.Security.CephX.Daemon, *runningCephVersion, *desiredCephVersion, cephObjectStore.Status.Cephx.Daemon)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStore, errors.Wrap(err, "failed to determine if cephx keys should be rotated")
+		}
+		if shouldRotateCephxKeys {
+			logger.Infof("cephx keys for CephObjectStore %q will be rotated", request.NamespacedName)
+		}
 	}
 
 	// validate the store settings
@@ -317,55 +466,49 @@ func (r *ReconcileCephObjectStore) reconcile(request reconcile.Request) (reconci
 		return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "invalid object store %q arguments", cephObjectStore.Name)
 	}
 
+	ownerInfo := k8sutil.NewOwnerInfo(cephObjectStore, r.scheme)
+	cfg := clusterConfig{
+		context:               r.context,
+		clusterInfo:           r.clusterInfo,
+		store:                 cephObjectStore,
+		rookVersion:           r.clusterSpec.CephVersion.Image,
+		clusterSpec:           r.clusterSpec,
+		DataPathMap:           config.NewStatelessDaemonDataPathMap(config.RgwType, cephObjectStore.Name, cephObjectStore.Namespace, r.clusterSpec.DataDirHostPath),
+		client:                r.client,
+		ownerInfo:             ownerInfo,
+		shouldRotateCephxKeys: shouldRotateCephxKeys,
+	}
+
 	// CREATE/UPDATE
-	_, err = r.reconcileCreateObjectStore(cephObjectStore, request.NamespacedName, cephCluster.Spec)
+	_, err = r.reconcileCreateObjectStore(cephObjectStore, request.NamespacedName, cfg)
 	if err != nil && kerrors.IsNotFound(err) {
-		logger.Info(opcontroller.OperatorNotInitializedMessage)
+		// A not found error may mean ceph is still initializing, but there might be some other error
+		// so we log the error and requeue
+		logger.Warningf("object store %q reconcile failed, ceph may still be initializing. %v", request.NamespacedName.String(), err)
 		return opcontroller.WaitForRequeueIfOperatorNotInitialized, *cephObjectStore, nil
 	} else if err != nil {
 		result, err := r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, "failed to create object store deployments", err)
 		return result, *cephObjectStore, err
 	}
 
-	objCtx, err := NewMultisiteContext(r.context, r.clusterInfo, cephObjectStore)
-	if err != nil {
-		return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to get object context")
-	}
-	opsCtx, err := NewMultisiteAdminOpsContext(objCtx, &cephObjectStore.Spec)
-	if err != nil {
-		return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to get admin ops API context")
-	}
-	err = removeDeprecatedHealthCheckBucket(r.clusterInfo.Context, opsCtx, cephObjectStore)
-	if err != nil {
-		return reconcile.Result{}, *cephObjectStore, errors.Wrap(err, "updated object store but failed to remove deprecated health check bucket")
-	}
-
 	// update ObservedGeneration in status at the end of reconcile
 	// Set Progressing status, we are done reconciling, the health check go routine will update the status
-	updateStatus(r.opManagerContext, observedGeneration, r.client, request.NamespacedName, cephv1.ConditionReady, buildStatusInfo(cephObjectStore))
+	cephxStatus := keyring.UpdatedCephxStatus(shouldRotateCephxKeys, cephCluster.Spec.Security.CephX.Daemon, r.clusterInfo.CephVersion, cephObjectStore.Status.Cephx.Daemon)
+	err = updateStatus(r.opManagerContext, observedGeneration, r.client, request.NamespacedName, cephv1.ConditionReady, buildStatusInfo(cephObjectStore), &cephxStatus)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStore, errors.Wrapf(err, "failed to set final status for cephObjectStore %q", request.NamespacedName)
+	}
 
 	// Return and do not requeue
 	logger.Debug("done reconciling")
 	return reconcile.Result{}, *cephObjectStore, nil
 }
 
-func (r *ReconcileCephObjectStore) reconcileCreateObjectStore(cephObjectStore *cephv1.CephObjectStore, namespacedName types.NamespacedName, cluster cephv1.ClusterSpec) (reconcile.Result, error) {
-	ownerInfo := k8sutil.NewOwnerInfo(cephObjectStore, r.scheme)
-	cfg := clusterConfig{
-		context:     r.context,
-		clusterInfo: r.clusterInfo,
-		store:       cephObjectStore,
-		rookVersion: r.clusterSpec.CephVersion.Image,
-		clusterSpec: r.clusterSpec,
-		DataPathMap: config.NewStatelessDaemonDataPathMap(config.RgwType, cephObjectStore.Name, cephObjectStore.Namespace, r.clusterSpec.DataDirHostPath),
-		client:      r.client,
-		ownerInfo:   ownerInfo,
-	}
+func (r *ReconcileCephObjectStore) reconcileCreateObjectStore(cephObjectStore *cephv1.CephObjectStore, namespacedName types.NamespacedName, cfg clusterConfig) (reconcile.Result, error) {
 	objContext, err := NewMultisiteContext(r.context, r.clusterInfo, cephObjectStore)
 	if err != nil {
 		return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to setup object store context", err)
 	}
-	objContext.CephClusterSpec = cluster
 
 	if cephObjectStore.Spec.IsExternal() {
 		logger.Info("reconciling external object store")
@@ -411,21 +554,21 @@ func (r *ReconcileCephObjectStore) reconcileCreateObjectStore(cephObjectStore *c
 			}
 		}
 
-		if err := UpdateEndpoint(objContext, cephObjectStore); err != nil {
+		if err := UpdateEndpointForAdminOps(objContext, cephObjectStore); err != nil {
 			return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to set endpoint", err)
 		}
 	} else {
 		logger.Info("reconciling object store deployments")
 
 		// Reconcile realm/zonegroup/zone CRs & update their names
-		realmName, zoneGroupName, zoneName, zone, reconcileResponse, err := r.reconcileMultisiteCRs(cephObjectStore)
+		realmName, zoneGroupName, zoneName, zone, reconcileResponse, err := r.getMultisiteResourceNames(cephObjectStore)
 		if err != nil {
 			return reconcileResponse, err
 		}
 
-		// Reconcile Ceph Zone if Multisite
+		// Reconcile Ceph Zone if Multisite to ensure it exists, or else requeue the request
 		if cephObjectStore.Spec.IsMultisite() {
-			reconcileResponse, err := r.reconcileCephZone(cephObjectStore, zoneGroupName, realmName)
+			reconcileResponse, err := r.retrieveMultisiteZone(cephObjectStore, zoneGroupName, realmName)
 			if err != nil {
 				return reconcileResponse, err
 			}
@@ -434,7 +577,7 @@ func (r *ReconcileCephObjectStore) reconcileCreateObjectStore(cephObjectStore *c
 		objContext.Realm = realmName
 		objContext.ZoneGroup = zoneGroupName
 		objContext.Zone = zoneName
-		logger.Debugf("realm for object-store is %q, zone group for object-store is %q, zone for object-store is %q", objContext.Realm, objContext.ZoneGroup, objContext.Zone)
+		logger.Debugf("realm is %q, zone group is %q, zone is %q, for object store %q", objContext.Realm, objContext.ZoneGroup, objContext.Zone, cephObjectStore.Name)
 
 		// RECONCILE SERVICE
 		logger.Debug("reconciling object store service")
@@ -443,39 +586,61 @@ func (r *ReconcileCephObjectStore) reconcileCreateObjectStore(cephObjectStore *c
 			return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to reconcile service", err)
 		}
 
-		if err := UpdateEndpoint(objContext, cephObjectStore); err != nil {
+		if err := UpdateEndpointForAdminOps(objContext, cephObjectStore); err != nil {
 			return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to set endpoint", err)
 		}
 
+		err = ValidateObjectStorePoolsConfig(cephObjectStore.Spec.MetadataPool, cephObjectStore.Spec.DataPool, cephObjectStore.Spec.SharedPools)
+		if err != nil {
+			return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "invalid pool configuration", err)
+		}
 		// Reconcile Pool Creation
 		if !cephObjectStore.Spec.IsMultisite() {
 			logger.Info("reconciling object store pools")
-			err = CreatePools(objContext, r.clusterSpec, cephObjectStore.Spec.MetadataPool, cephObjectStore.Spec.DataPool)
-			if err != nil {
-				return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to create object pools", err)
+
+			if IsNeedToCreateObjectStorePools(cephObjectStore.Spec.SharedPools) {
+				err = CreateObjectStorePools(objContext, r.clusterSpec, cephObjectStore.Spec.MetadataPool, cephObjectStore.Spec.DataPool)
+				if err != nil {
+					return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to create object pools", err)
+				}
 			}
 		}
 
-		// Reconcile Multisite Creation
-		logger.Infof("setting multisite settings for object store %q", cephObjectStore.Name)
-		err = setMultisite(objContext, cephObjectStore, zone)
+		// Reconcile the object store
+		logger.Infof("configuring object store %q", cephObjectStore.Name)
+		err = configureObjectStore(objContext, cephObjectStore, zone)
 		if err != nil && kerrors.IsNotFound(err) {
 			return reconcile.Result{}, err
 		} else if err != nil {
 			return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, namespacedName, "failed to configure multisite for object store", err)
 		}
 
-		// Create or Update Store
-		err = cfg.createOrUpdateStore(realmName, zoneGroupName, zoneName)
+		// Retrieve the keystone secret if specified
+		var keystoneSecret *corev1.Secret
+		if ks := cephObjectStore.Spec.Auth.Keystone; ks != nil {
+			keystoneSecret, err = objContext.Context.Clientset.CoreV1().Secrets(objContext.clusterInfo.Namespace).Get(objContext.clusterInfo.Context, ks.ServiceUserSecretName, metav1.GetOptions{})
+			if err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to get the keystone credential secret")
+			}
+		}
+
+		// Create or Update store
+		err = cfg.createOrUpdateStore(realmName, zoneGroupName, zoneName, keystoneSecret)
 		if err != nil {
 			return reconcile.Result{}, errors.Wrapf(err, "failed to create object store %q", cephObjectStore.Name)
+		}
+		if cephObjectStore.Spec.DefaultRealm {
+			logger.Debugf("marking realm %q as default for object store %q", realmName, cephObjectStore.Name)
+			if err := SetDefaultRealm(objContext, realmName); err != nil {
+				return reconcile.Result{}, errors.Wrapf(err, "failed to set realm %q as default", realmName)
+			}
 		}
 	}
 
 	return reconcile.Result{}, nil
 }
 
-func (r *ReconcileCephObjectStore) reconcileCephZone(store *cephv1.CephObjectStore, zoneGroupName string, realmName string) (reconcile.Result, error) {
+func (r *ReconcileCephObjectStore) retrieveMultisiteZone(store *cephv1.CephObjectStore, zoneGroupName string, realmName string) (reconcile.Result, error) {
 	realmArg := fmt.Sprintf("--rgw-realm=%s", realmName)
 	zoneGroupArg := fmt.Sprintf("--rgw-zonegroup=%s", zoneGroupName)
 	zoneArg := fmt.Sprintf("--rgw-zone=%s", store.Spec.Zone.Name)
@@ -495,79 +660,41 @@ func (r *ReconcileCephObjectStore) reconcileCephZone(store *cephv1.CephObjectSto
 	return reconcile.Result{}, nil
 }
 
-func (r *ReconcileCephObjectStore) reconcileMultisiteCRs(cephObjectStore *cephv1.CephObjectStore) (string, string, string, *cephv1.CephObjectZone, reconcile.Result, error) {
-	if cephObjectStore.Spec.IsMultisite() {
-		zoneName := cephObjectStore.Spec.Zone.Name
-		zone := &cephv1.CephObjectZone{}
-		err := r.client.Get(r.opManagerContext, types.NamespacedName{Name: zoneName, Namespace: cephObjectStore.Namespace}, zone)
-		if err != nil {
-			if kerrors.IsNotFound(err) {
-				return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, err
-			}
-			return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, errors.Wrapf(err, "error getting CephObjectZone %q", cephObjectStore.Spec.Zone.Name)
-		}
-		logger.Debugf("CephObjectZone resource %s found", zone.Name)
-
-		zonegroup := &cephv1.CephObjectZoneGroup{}
-		err = r.client.Get(r.opManagerContext, types.NamespacedName{Name: zone.Spec.ZoneGroup, Namespace: cephObjectStore.Namespace}, zonegroup)
-		if err != nil {
-			if kerrors.IsNotFound(err) {
-				return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, err
-			}
-			return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, errors.Wrapf(err, "error getting CephObjectZoneGroup %q", zone.Spec.ZoneGroup)
-		}
-		logger.Debugf("CephObjectZoneGroup resource %s found", zonegroup.Name)
-
-		realm := &cephv1.CephObjectRealm{}
-		err = r.client.Get(r.opManagerContext, types.NamespacedName{Name: zonegroup.Spec.Realm, Namespace: cephObjectStore.Namespace}, realm)
-		if err != nil {
-			if kerrors.IsNotFound(err) {
-				return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, err
-			}
-			return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, errors.Wrapf(err, "error getting CephObjectRealm %q", zonegroup.Spec.Realm)
-		}
-		logger.Debugf("CephObjectRealm resource %s found", realm.Name)
-
-		return realm.Name, zonegroup.Name, zone.Name, zone, reconcile.Result{}, nil
+func (r *ReconcileCephObjectStore) getMultisiteResourceNames(cephObjectStore *cephv1.CephObjectStore) (string, string, string, *cephv1.CephObjectZone, reconcile.Result, error) {
+	if !cephObjectStore.Spec.IsMultisite() {
+		return cephObjectStore.Name, cephObjectStore.Name, cephObjectStore.Name, nil, reconcile.Result{}, nil
 	}
 
-	return cephObjectStore.Name, cephObjectStore.Name, cephObjectStore.Name, nil, reconcile.Result{}, nil
-}
-
-// handle upgrade from v1.10; we need to remove the health checker bucket from the store, or
-// deleting the store will be stuck on dependents because an unknown bucket exists
-// TODO: remove this for Rook v1.12 release
-var removeDeprecatedHealthCheckBucket = func(ctx context.Context, opsCtx *AdminOpsContext, cos *cephv1.CephObjectStore) error {
-	healthCheckBucket := genHealthCheckerBucketName(string(cos.UID))
-	doPurge := true // purge all content of the bucket
-	bucket := admin.Bucket{Bucket: healthCheckBucket, PurgeObject: &doPurge}
-	remErr := opsCtx.AdminOpsClient.RemoveBucket(ctx, bucket)
-
-	if remErr == nil {
-		logger.Info("successfully deleted deprecated health checker bucket")
-		return nil
-	}
-
-	if errors.Is(remErr, admin.ErrNoSuchBucket) {
-		logger.Debug("deprecated health checker bucket already does not exist: NoSuchBucket")
-		return nil
-	}
-
-	if errors.Is(remErr, admin.ErrNoSuchKey) {
-		// ceph might return NoSuchKey than NoSuchBucket when the target bucket does not exist.
-		// then we can use GetBucketInfo() to judge the existence of the bucket.
-		// see: https://github.com/ceph/ceph/pull/44413
-		_, getErr := opsCtx.AdminOpsClient.GetBucketInfo(ctx, bucket)
-		if getErr != nil {
-			if errors.Is(getErr, admin.ErrNoSuchBucket) {
-				logger.Debug("deprecated health checker bucket already does not exist: NoSuchKey")
-				return nil
-			}
-			// both commands errored; something is up; be sure to return both errors
-			return errors.Wrapf(remErr, "failed to delete deprecated health checker bucket %q. failed to get bucket info. %v", healthCheckBucket, getErr)
+	zoneName := cephObjectStore.Spec.Zone.Name
+	zone := &cephv1.CephObjectZone{}
+	err := r.client.Get(r.opManagerContext, types.NamespacedName{Name: zoneName, Namespace: cephObjectStore.Namespace}, zone)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, err
 		}
-		// remove bucket failed, and bucket exists; something else went wrong with remove bucket
+		return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, errors.Wrapf(err, "error getting CephObjectZone %q", cephObjectStore.Spec.Zone.Name)
 	}
+	logger.Debugf("CephObjectZone resource %s found", zone.Name)
 
-	return errors.Wrapf(remErr, "failed to delete deprecated health checker bucket %q", healthCheckBucket)
+	zonegroup := &cephv1.CephObjectZoneGroup{}
+	err = r.client.Get(r.opManagerContext, types.NamespacedName{Name: zone.Spec.ZoneGroup, Namespace: cephObjectStore.Namespace}, zonegroup)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, err
+		}
+		return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, errors.Wrapf(err, "error getting CephObjectZoneGroup %q", zone.Spec.ZoneGroup)
+	}
+	logger.Debugf("CephObjectZoneGroup resource %s found", zonegroup.Name)
+
+	realm := &cephv1.CephObjectRealm{}
+	err = r.client.Get(r.opManagerContext, types.NamespacedName{Name: zonegroup.Spec.Realm, Namespace: cephObjectStore.Namespace}, realm)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, err
+		}
+		return "", "", "", nil, waitForRequeueIfObjectStoreNotReady, errors.Wrapf(err, "error getting CephObjectRealm %q", zonegroup.Spec.Realm)
+	}
+	logger.Debugf("CephObjectRealm resource %s found", realm.Name)
+
+	return realm.Name, zonegroup.Name, zone.Name, zone, reconcile.Result{}, nil
 }

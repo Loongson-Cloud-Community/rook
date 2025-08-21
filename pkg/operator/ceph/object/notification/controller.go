@@ -19,6 +19,7 @@ package notification
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
@@ -28,6 +29,7 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/object"
 	"github.com/rook/rook/pkg/operator/ceph/object/bucket"
 	"github.com/rook/rook/pkg/operator/ceph/object/topic"
 	"github.com/rook/rook/pkg/operator/ceph/reporting"
@@ -51,10 +53,12 @@ const (
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", packageName)
 
-var waitForRequeueIfTopicNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
-var waitForRequeueIfNotificationNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
-var waitForRequeueIfObjectBucketNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
-var waitForRequeueIfNotificationNotDeleted = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+var (
+	waitForRequeueIfTopicNotReady          = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+	waitForRequeueIfNotificationNotReady   = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+	waitForRequeueIfObjectBucketNotReady   = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+	waitForRequeueIfNotificationNotDeleted = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+)
 
 // ReconcileNotifications reconciles a CephbucketNotification
 type ReconcileNotifications struct {
@@ -67,6 +71,11 @@ type ReconcileNotifications struct {
 // Add creates a new CephBucketNotification controller and a new ObjectBucketClaim Controller and adds it to the Manager.
 // The Manager will set fields on the Controller and start it when the Manager is started.
 func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
+	if os.Getenv(object.DisableOBCEnvVar) == "true" {
+		logger.Info("skip running Object Bucket Notification controller")
+		return nil
+	}
+
 	if err := addNotificationReconciler(mgr, &ReconcileNotifications{
 		client:           mgr.GetClient(),
 		context:          context,
@@ -93,7 +102,14 @@ func addNotificationReconciler(mgr manager.Manager, r reconcile.Reconciler) erro
 	logger.Info("successfully started")
 
 	// Watch for changes on the OBC CRD object
-	err = c.Watch(&source.Kind{Type: &cephv1.CephBucketNotification{}}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephBucketNotification{},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephBucketNotification]{},
+			opcontroller.WatchControllerPredicate[*cephv1.CephBucketNotification](mgr.GetScheme()),
+		),
+	)
 	if err != nil {
 		return err
 	}
@@ -105,6 +121,7 @@ func addNotificationReconciler(mgr manager.Manager, r reconcile.Reconciler) erro
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileNotifications) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	reconcileResponse, notification, err := r.reconcile(request)
 	if err != nil {
 		logger.Errorf("failed to reconcile %v", err)

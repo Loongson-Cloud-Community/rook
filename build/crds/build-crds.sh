@@ -20,12 +20,12 @@ set -o pipefail
 # set BUILD_CRDS_INTO_DIR to build the CRD results into the given dir instead of in-place
 : "${BUILD_CRDS_INTO_DIR:=}"
 
-SCRIPT_ROOT=$( cd "$( dirname "${BASH_SOURCE[0]}" )/../.." && pwd -P)
+SCRIPT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 CONTROLLER_GEN_BIN_PATH=$1
 YQ_BIN_PATH=$2
 : "${MAX_DESC_LEN:=-1}"
 # allowDangerousTypes is used to accept float64
-CRD_OPTIONS="crd:maxDescLen=$MAX_DESC_LEN,trivialVersions=true,generateEmbeddedObjectMeta=true,allowDangerousTypes=true"
+CRD_OPTIONS="crd:maxDescLen=$MAX_DESC_LEN,generateEmbeddedObjectMeta=true,allowDangerousTypes=true"
 
 DESTINATION_ROOT="$SCRIPT_ROOT"
 if [[ -n "$BUILD_CRDS_INTO_DIR" ]]; then
@@ -36,7 +36,7 @@ OLM_CATALOG_DIR="${DESTINATION_ROOT}/deploy/olm/deploy/crds"
 CEPH_CRDS_FILE_PATH="${DESTINATION_ROOT}/deploy/examples/crds.yaml"
 CEPH_HELM_CRDS_FILE_PATH="${DESTINATION_ROOT}/deploy/charts/rook-ceph/templates/resources.yaml"
 
-if [[ "$($YQ_BIN_PATH --version)" != "yq (https://github.com/mikefarah/yq/) version 4."* ]]; then
+if [[ "$($YQ_BIN_PATH --version)" != "yq (https://github.com/mikefarah/yq/) version v4."* ]]; then
   echo "yq must be version 4.x"
   exit 1
 fi
@@ -59,9 +59,9 @@ generating_crds_v1() {
 }
 
 generating_main_crd() {
-  true > "$CEPH_CRDS_FILE_PATH"
-  true > "$CEPH_HELM_CRDS_FILE_PATH"
-cat <<EOF > "$CEPH_CRDS_FILE_PATH"
+  true >"$CEPH_CRDS_FILE_PATH"
+  true >"$CEPH_HELM_CRDS_FILE_PATH"
+  cat <<EOF >"$CEPH_CRDS_FILE_PATH"
 ##############################################################################
 # Create the CRDs that are necessary before creating your Rook cluster.
 # These resources *must* be created before the cluster.yaml or their variants.
@@ -110,7 +110,25 @@ while read -r line; do
   CRD_FILES+=("$line")
 done < <(find "$OLM_CATALOG_DIR" -type f -name '*.yaml' | sort)
 
-echo "---" >> "$CEPH_CRDS_FILE_PATH" # yq doesn't output the first doc separator
-$YQ_BIN_PATH eval-all '.' "${CRD_FILES[@]}" >> "$CEPH_CRDS_FILE_PATH"
+echo "---" >>"$CEPH_CRDS_FILE_PATH" # yq doesn't output the first doc separator
+$YQ_BIN_PATH eval-all '.' "${CRD_FILES[@]}" >>"$CEPH_CRDS_FILE_PATH"
 
+# Remove long, repeat descriptions in CRDs, especially for things that are well-known K8s types
+# Use this to manually inspect descriptions to see where there are repetitions of long ones:
+#   cat deploy/examples/crds.yaml | grep description | sed 's/^[[:space:]]*//g' | sort > desc.yml
+
+# remove descriptions from all placement configs
+$YQ_BIN_PATH --inplace eval 'del(.. | .placement? | .. | .description?)' "$CEPH_CRDS_FILE_PATH"
+$YQ_BIN_PATH --inplace eval 'del(.. | .preparePlacement? | .. | .description?)' "$CEPH_CRDS_FILE_PATH"
+
+$YQ_BIN_PATH --inplace eval 'del(.. | .terminationGracePeriodSeconds? | .description?)' "$CEPH_CRDS_FILE_PATH"
+
+# volume source usage is a well-known k8s type
+$YQ_BIN_PATH --inplace eval 'del(.. | .volumeSource? | .. | .description?)' "$CEPH_CRDS_FILE_PATH"
+
+# yq turns 'creationTimestamp: null' into 'creationTimestamp: {}' in CRDs
+# this field is also unnecessary, so just remove it
+$YQ_BIN_PATH --inplace eval 'del(.. | .creationTimestamp?)' "$CEPH_CRDS_FILE_PATH"
+
+# generate helm resources after pruning
 build_helm_resources

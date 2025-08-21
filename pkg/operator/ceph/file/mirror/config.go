@@ -19,9 +19,9 @@ package mirror
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
-	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 )
 
@@ -36,11 +36,6 @@ const (
 `
 	user   = "client.fs-mirror"
 	userID = "fs-mirror"
-)
-
-var (
-	// PeerAdditionMinVersion This version includes a number of fixes for snapshots and mirror status
-	PeerAdditionMinVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 5}
 )
 
 // daemonConfig for a single rbd-mirror
@@ -64,6 +59,15 @@ func (r *ReconcileFilesystemMirror) generateKeyring(daemonConfig *daemonConfig) 
 		return "", err
 	}
 
+	if r.shouldRotateCephxKeys {
+		logger.Infof("rotating CephX key for CephFileSystemMirror %q in the namespace %q", daemonConfig.ResourceName, r.clusterInfo.Namespace)
+		newKey, err := s.RotateKey(user)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to rotate CephX key for CephFileSystemMirror %q in the namespace %q", daemonConfig.ResourceName, r.clusterInfo.Namespace)
+		}
+		key = newKey
+	}
+
 	keyring := fmt.Sprintf(keyringTemplate, key)
-	return keyring, s.CreateOrUpdate(daemonConfig.ResourceName, keyring)
+	return s.CreateOrUpdate(daemonConfig.ResourceName, keyring)
 }

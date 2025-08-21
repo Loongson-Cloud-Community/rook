@@ -19,13 +19,10 @@ package object
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"reflect"
 	"testing"
 	"time"
-
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/coreos/pkg/capnslog"
 	"github.com/pkg/errors"
@@ -34,13 +31,17 @@ import (
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
 	"github.com/rook/rook/pkg/operator/test"
 	"github.com/rook/rook/pkg/util/dependents"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -66,7 +67,7 @@ const (
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "my-store",
 		"api_name": "my-store",
-		"is_master": "true",
+		"is_master": true,
 		"endpoints": [
 			"http://rook-ceph-rgw-my-store.rook-ceph.svc:80"
 		],
@@ -144,9 +145,10 @@ const (
 	dummyVersionsRaw          = `
 	{
 		"mon": {
-			"ceph version 17.2.1 (0000000000000000) quincy (stable)": 3
+			"ceph version 20.2.0 (0000000000000000) tentacle (stable)": 3
 		}
 	}`
+	//nolint:gosec // only test values, not a real secret
 	userCreateJSON = `{
 	"user_id": "my-user",
 	"display_name": "my-user",
@@ -201,7 +203,7 @@ const (
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "zonegroup-a",
 		"api_name": "zonegroup-a",
-		"is_master": "true",
+		"is_master": true,
 		"endpoints": [],
 		"hostnames": [],
 		"hostnames_s3website": [],
@@ -237,7 +239,7 @@ const (
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "zonegroup-a",
 		"api_name": "zonegroup-a",
-		"is_master": "true",
+		"is_master": true,
 		"endpoints": [
 			"http://rook-ceph-rgw-my-store.rook-ceph.svc:80"
         ],
@@ -342,8 +344,9 @@ func TestCephObjectStoreController(t *testing.T) {
 		// A Pool resource with metadata and spec.
 		objectStore := &cephv1.CephObjectStore{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      store,
-				Namespace: namespace,
+				Name:       store,
+				Namespace:  namespace,
+				Finalizers: []string{"cephobjectstore.ceph.rook.io"},
 			},
 			Spec:     cephv1.ObjectStoreSpec{MetadataPool: cephv1.PoolSpec{Replicated: cephv1.ReplicatedSpec{Size: 1}}, DataPool: cephv1.PoolSpec{Replicated: cephv1.ReplicatedSpec{Size: 1}}},
 			TypeMeta: controllerTypeMeta,
@@ -355,9 +358,7 @@ func TestCephObjectStoreController(t *testing.T) {
 			objectStore,
 		}
 
-		for i := range additionalObjects {
-			objects = append(objects, additionalObjects[i])
-		}
+		objects = append(objects, additionalObjects...)
 
 		executor := &exectest.MockExecutor{
 			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
@@ -403,7 +404,7 @@ func TestCephObjectStoreController(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
-		return &cephver.Pacific, &cephver.Pacific, nil
+		return &cephver.Reef, &cephver.Reef, nil
 	}
 
 	t.Run("error - no ceph cluster", func(t *testing.T) {
@@ -489,7 +490,7 @@ func TestCephObjectStoreController(t *testing.T) {
 					// ceph actually outputs this all on one line, but this parses the same
 					return `[
 						{"poolnum":1,"poolname":"replicapool"},
-						{"poolnum":2,"poolname":"device_health_metrics"},
+						{"poolnum":2,"poolname":".mgr"},
 						{"poolnum":3,"poolname":".rgw.root"},
 						{"poolnum":4,"poolname":"my-store.rgw.buckets.index"},
 						{"poolnum":5,"poolname":"my-store.rgw.buckets.non-ec"},
@@ -499,6 +500,13 @@ func TestCephObjectStoreController(t *testing.T) {
 						{"poolnum":9,"poolname":"my-store.rgw.buckets.data"}
 					]`, nil
 				}
+				if args[0] == "mirror" && args[2] == "info" {
+					return "{}", nil
+				}
+				if args[0] == "mirror" && args[2] == "disable" {
+					return "", nil
+				}
+
 				return "", nil
 			},
 			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
@@ -528,10 +536,6 @@ func TestCephObjectStoreController(t *testing.T) {
 	t.Run("success - object store is running", func(t *testing.T) {
 		r := setupEnvironmentWithReadyCephCluster()
 
-		removeDeprecatedHealthCheckBucket = func(ctx context.Context, opsCtx *AdminOpsContext, cos *cephv1.CephObjectStore) error {
-			return nil
-		}
-
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.False(t, res.Requeue)
@@ -543,19 +547,7 @@ func TestCephObjectStoreController(t *testing.T) {
 		assert.NotEmpty(t, objectStore.Status.Info["endpoint"], objectStore)
 		assert.Equal(t, "http://rook-ceph-rgw-my-store.rook-ceph.svc:80", objectStore.Status.Info["endpoint"], objectStore)
 		assert.True(t, calledCommitConfigChanges)
-		assert.Equal(t, 16, r.clusterInfo.CephVersion.Major)
-	})
-
-	t.Run("failed to remove deprecated health check bucket", func(t *testing.T) {
-		r := setupEnvironmentWithReadyCephCluster()
-
-		removeDeprecatedHealthCheckBucket = func(ctx context.Context, opsCtx *AdminOpsContext, cos *cephv1.CephObjectStore) error {
-			return fmt.Errorf("induced error")
-		}
-
-		_, err := r.Reconcile(ctx, req)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "deprecated health check bucket")
+		assert.Equal(t, 18, r.clusterInfo.CephVersion.Major)
 	})
 }
 
@@ -563,6 +555,9 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 	ctx := context.TODO()
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
 	zoneName := "zone-a"
 	zoneGroupName := "zonegroup-a"
@@ -639,8 +634,9 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 
 	objectStore := &cephv1.CephObjectStore{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      store,
-			Namespace: namespace,
+			Name:       store,
+			Namespace:  namespace,
+			Finalizers: []string{"cephobjectstore.ceph.rook.io"},
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind: "CephObjectStore",
@@ -683,9 +679,10 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 				return realmGetMultisiteJSON, nil
 			}
 			if args[0] == "zonegroup" {
-				if args[1] == "get" {
+				switch args[1] {
+				case "get":
 					return zoneGroupGetMultisiteJSON, nil
-				} else if args[1] == "modify" {
+				case "modify":
 					zoneGroupGetMultisiteJSON = zoneGroupGetMultisiteJSONWithEndpoint
 					return zoneGroupGetMultisiteJSON, nil
 				}
@@ -748,11 +745,7 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
-		return &cephver.Pacific, &cephver.Pacific, nil
-	}
-
-	removeDeprecatedHealthCheckBucket = func(ctx context.Context, opsCtx *AdminOpsContext, cos *cephv1.CephObjectStore) error {
-		return nil
+		return &cephver.Reef, &cephver.Reef, nil
 	}
 
 	t.Run("create an object store", func(t *testing.T) {
@@ -780,7 +773,15 @@ func TestCephObjectStoreControllerMultisite(t *testing.T) {
 		objectStore.DeletionTimestamp = &metav1.Time{
 			Time: time.Now(),
 		}
-		err = r.client.Update(ctx, objectStore)
+		objectStore.Finalizers = []string{"cephobjectstore.ceph.rook.io"}
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		r := &ReconcileCephObjectStore{
+			client:           cl,
+			scheme:           s,
+			context:          c,
+			recorder:         record.NewFakeRecorder(5),
+			opManagerContext: ctx,
+		}
 
 		// have to also track the same objects in the rook clientset
 		r.context.RookClientset = rookfake.NewSimpleClientset(
@@ -916,7 +917,7 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
-		return &cephver.Pacific, &cephver.Pacific, nil
+		return &cephver.Reef, &cephver.Reef, nil
 	}
 
 	{
@@ -927,10 +928,6 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 		}
 
 		r := getReconciler(objects)
-
-		removeDeprecatedHealthCheckBucket = func(ctx context.Context, opsCtx *AdminOpsContext, cos *cephv1.CephObjectStore) error {
-			return nil
-		}
 
 		t.Run("create an external object store", func(t *testing.T) {
 			res, err := r.Reconcile(ctx, req)
@@ -953,8 +950,8 @@ func TestCephObjectExternalStoreController(t *testing.T) {
 			externalObjectStore.DeletionTimestamp = &metav1.Time{
 				Time: time.Now(),
 			}
-			err = r.client.Update(ctx, externalObjectStore)
-			assert.NoError(t, err)
+			externalObjectStore.Finalizers = []string{"cephobjectstore.ceph.rook.io"}
+			r := getReconciler(objects)
 
 			// have to also track the same objects in the rook clientset
 			r.context.RookClientset = rookfake.NewSimpleClientset(externalObjectStore)
@@ -1001,22 +998,22 @@ func TestDiffVersions(t *testing.T) {
 			if args[0] == "versions" {
 				return `{
     "mon": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 3
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 3
     },
     "mgr": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 1
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 1
     },
     "osd": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 3
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 3
     },
     "mds": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 2
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 2
     },
     "rgw": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 1
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 1
     },
     "overall": {
-        "ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)": 10
+        "ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)": 10
     }
 }`, nil
 			}
@@ -1026,7 +1023,7 @@ func TestDiffVersions(t *testing.T) {
 	c := &clusterd.Context{Executor: executor}
 
 	// desiredCephVersion comes from DetectCephVersion() (ceph --version) which uses ExtractCephVersion()
-	desiredCephVersion, err := cephver.ExtractCephVersion("ceph version 17.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) quincy (dev)")
+	desiredCephVersion, err := cephver.ExtractCephVersion("ceph version 19.0.0-9718-g4ff72306 (4ff723061fc15c803dcf6556d02f56bdf56de5fa) squid (dev)")
 	assert.NoError(t, err)
 
 	// runningCephVersion comes from LeastUptodateDaemonVersion()
@@ -1038,4 +1035,463 @@ func TestDiffVersions(t *testing.T) {
 
 	// Compares the actual value of the pointer by dereferencing the pointer
 	assert.True(t, reflect.DeepEqual(runningCephVersion, *desiredCephVersion))
+}
+
+func Test_mapSecretToCR(t *testing.T) {
+	t.Run("secret not referenced", func(t *testing.T) {
+		// create fake k8s cliend and add CephObjectStore objects
+		var objects []runtime.Object
+		o := simpleStore()
+		o.Namespace = "ns"
+		o.Name = "store1"
+		objects = append(objects, o)
+		s := scheme.Scheme
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStore{})
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStoreList{})
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
+		mapFunc := mapSecretToCR(cl)
+		got := mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns",
+			},
+		})
+		assert.Empty(t, got, "expected empty list")
+	})
+	t.Run("secret referenced in rgw config", func(t *testing.T) {
+		// create fake k8s cliend and add CephObjectStore objects
+		var objects []runtime.Object
+		otherStore := simpleStore()
+		otherStore.Namespace = "ns"
+		otherStore.Name = "store1"
+		inConf := simpleStore()
+		inConf.Namespace = "ns"
+		inConf.Name = "store2"
+		inConf.Spec.Gateway.RgwConfigFromSecret = map[string]v1.SecretKeySelector{
+			"rgw": {Key: "key", LocalObjectReference: v1.LocalObjectReference{Name: "secret"}},
+		}
+		objects = append(objects, otherStore, inConf)
+		s := scheme.Scheme
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStore{})
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStoreList{})
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
+		mapFunc := mapSecretToCR(cl)
+		got := mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns",
+			},
+		})
+		assert.Len(t, got, 1, "expected 1 item")
+		assert.Equal(t, "store2", got[0].Name, "expected store2")
+
+		got = mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret-other",
+				Namespace: "ns",
+			},
+		})
+		assert.Empty(t, got, "empty: wrong secret name")
+
+		got = mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns-other",
+			},
+		})
+		assert.Empty(t, got, "empty: wrong secret ns")
+	})
+	t.Run("secret referenced in keystone config", func(t *testing.T) {
+		// create fake k8s cliend and add CephObjectStore objects
+		var objects []runtime.Object
+		otherStore := simpleStore()
+		otherStore.Namespace = "ns"
+		otherStore.Name = "store1"
+		inConf := simpleStore()
+		inConf.Namespace = "ns"
+		inConf.Name = "store2"
+		inConf.Spec.Auth.Keystone = &cephv1.KeystoneSpec{
+			ServiceUserSecretName: "secret",
+		}
+		objects = append(objects, otherStore, inConf)
+		s := scheme.Scheme
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStore{})
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStoreList{})
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
+		mapFunc := mapSecretToCR(cl)
+		got := mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns",
+			},
+		})
+		assert.Len(t, got, 1, "expected 1 item")
+		assert.Equal(t, "store2", got[0].Name, "expected store2")
+
+		got = mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret-other",
+				Namespace: "ns",
+			},
+		})
+		assert.Empty(t, got, "empty: wrong secret name")
+
+		got = mapFunc(context.TODO(), &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret",
+				Namespace: "ns-other",
+			},
+		})
+		assert.Empty(t, got, "empty: wrong secret ns")
+	})
+}
+
+func TestKeyRotation(t *testing.T) {
+	// test key rotation end-to-end
+
+	ctx := context.TODO()
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	zoneName := "zone-a"
+	zoneGroupName := "zonegroup-a"
+	realmName := "realm-a"
+
+	metadataPool := cephv1.PoolSpec{}
+	dataPool := cephv1.PoolSpec{}
+
+	cephCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      namespace,
+			Namespace: namespace,
+		},
+		Status: cephv1.ClusterStatus{
+			Phase: k8sutil.ReadyStatus,
+			CephStatus: &cephv1.CephStatus{
+				Health: "HEALTH_OK",
+			},
+		},
+	}
+
+	secrets := map[string][]byte{
+		"fsid":         []byte(name),
+		"mon-secret":   []byte("monsecret"),
+		"admin-secret": []byte("adminsecret"),
+	}
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rook-ceph-mon",
+			Namespace: namespace,
+		},
+		Data: secrets,
+		Type: k8sutil.RookType,
+	}
+
+	objectZone := &cephv1.CephObjectZone{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      zoneName,
+			Namespace: namespace,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectZone",
+		},
+		Spec: cephv1.ObjectZoneSpec{
+			ZoneGroup:    zoneGroupName,
+			MetadataPool: metadataPool,
+			DataPool:     dataPool,
+		},
+	}
+
+	objectZoneGroup := &cephv1.CephObjectZoneGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      zoneGroupName,
+			Namespace: namespace,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectZoneGroup",
+		},
+		Spec: cephv1.ObjectZoneGroupSpec{},
+	}
+
+	objectZoneGroup.Spec.Realm = realmName
+
+	objectRealm := &cephv1.CephObjectRealm{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      realmName,
+			Namespace: namespace,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectRealm",
+		},
+		Spec: cephv1.ObjectRealmSpec{},
+	}
+
+	objectStore := &cephv1.CephObjectStore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       store,
+			Namespace:  namespace,
+			Finalizers: []string{"cephobjectstore.ceph.rook.io"},
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectStore",
+		},
+		Spec: cephv1.ObjectStoreSpec{},
+	}
+
+	objectStore.Spec.Zone.Name = zoneName
+	objectStore.Spec.Gateway.Port = 80
+	zoneGroupGetMultisiteJSON := zoneGroupGetMultisiteJSONWithoutEndpoint
+	object := []runtime.Object{
+		objectZone,
+		objectStore,
+		objectZoneGroup,
+		objectRealm,
+		cephCluster,
+	}
+
+	// auth rotate returns an array instead of a single object
+	rotatedKeyJson := `[{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}]`
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if args[0] == "status" {
+				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+			}
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return rgwCephAuthGetOrCreateKey, nil
+			}
+			if args[0] == "auth" && args[1] == "rotate" {
+				t.Logf("rotating key and returning: %s", rotatedKeyJson)
+				return rotatedKeyJson, nil
+			}
+			if args[0] == "osd" && args[1] == "pool" && args[2] == "get" {
+				return "", errors.New("test pool does not exit yet")
+			}
+			if args[0] == "versions" {
+				return dummyVersionsRaw, nil
+			}
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			if args[0] == "realm" && args[1] == "list" {
+				return realmListMultisiteJSON, nil
+			}
+			if args[0] == "realm" && args[1] == "get" {
+				return realmGetMultisiteJSON, nil
+			}
+			if args[0] == "zonegroup" {
+				switch args[1] {
+				case "get":
+					return zoneGroupGetMultisiteJSON, nil
+				case "modify":
+					zoneGroupGetMultisiteJSON = zoneGroupGetMultisiteJSONWithEndpoint
+					return zoneGroupGetMultisiteJSON, nil
+				}
+			}
+			if args[0] == "zone" && args[1] == "get" {
+				return zoneGetMultisiteJSON, nil
+			}
+			if args[0] == "user" && args[1] == "create" {
+				return userCreateJSON, nil
+			}
+			return "", nil
+		},
+	}
+
+	commitConfigChangesOrig := commitConfigChanges
+	defer func() { commitConfigChanges = commitConfigChangesOrig }()
+
+	// make sure joining multisite calls to commit config changes
+	calledCommitConfigChanges := false
+	commitConfigChanges = func(c *Context) error {
+		calledCommitConfigChanges = true
+		return nil
+	}
+
+	clientset := test.New(t, 3)
+	c := &clusterd.Context{
+		Executor: executor,
+		RookClientset: rookfake.NewSimpleClientset(
+			objectRealm,
+			objectZoneGroup,
+			objectZone,
+			objectStore,
+		),
+		Clientset: clientset,
+	}
+
+	// Register operator types with the runtime scheme.
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectZone{}, &cephv1.CephObjectZoneList{}, &cephv1.CephCluster{}, &cephv1.CephClusterList{}, &cephv1.CephObjectStore{}, &cephv1.CephObjectStoreList{})
+
+	// Create a fake client to mock API calls.
+	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+	r := &ReconcileCephObjectStore{
+		client:           cl,
+		scheme:           s,
+		context:          c,
+		recorder:         record.NewFakeRecorder(10),
+		opManagerContext: ctx,
+	}
+
+	_, err := r.context.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      store,
+			Namespace: namespace,
+		},
+	}
+
+	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
+		rotateSupportedVer := cephver.CephVersion{Major: 20, Minor: 2, Extra: 0}
+		return &rotateSupportedVer, &rotateSupportedVer, nil
+	}
+
+	// NOTE: these unit subtests are not independent. they share state between tests
+
+	// Rotation is not tested exhaustively for every config. The tests are most concerned with
+	// ensuring rotation does happen based on inputs and that outputs are updated as expected, for
+	// both brownfield and greenfield cases. Cephx helper functions for determining when to rotate
+	// and how to update the status are well tested, so we use good-faith assumption that the
+	// reconcile implementation uses those, allowing tests here to focus on only the UX aspects
+
+	t.Run("first reconcile", func(t *testing.T) {
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, calledCommitConfigChanges)
+
+		oStore := cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(1), oStore.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", oStore.Status.Cephx.Daemon.KeyCephVersion)
+
+		// ensure ceph identifier annotation applied to pod, resulting in daemon restart
+		deploy, err := clientset.AppsV1().Deployments(namespace).Get(ctx, "rook-ceph-rgw-"+store+"-a", metav1.GetOptions{})
+		assert.NoError(t, err)
+		// mock contexts preserve the secret's resource version, so we can't test in unit that
+		// resource ver is applied exactly. However, presence of the cephx identifier annotation
+		// should be good enough to assume the code is updating and applying it in good faith
+		_, ok := deploy.Spec.Template.Annotations[keyring.CephxKeyIdentifierAnnotation]
+		assert.True(t, ok)
+	})
+
+	t.Run("subsequent reconcile - retain cephx status", func(t *testing.T) {
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, calledCommitConfigChanges)
+
+		oStore := cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(1), oStore.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", oStore.Status.Cephx.Daemon.KeyCephVersion)
+	})
+
+	t.Run("brownfield reconcile - retain unknown cephx status", func(t *testing.T) {
+		// mimic brownfield oStore from before cephx tracking by setting cephx status empty
+		oStore := cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		oStore.Status.Cephx.Daemon = cephv1.CephxStatus{}
+		err = cl.Update(ctx, &oStore)
+		assert.NoError(t, err)
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, calledCommitConfigChanges)
+
+		oStore = cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{}, oStore.Status.Cephx.Daemon)
+	})
+
+	t.Run("rotate key - brownfield unknown status becomes known", func(t *testing.T) {
+		cluster := cephv1.CephCluster{}
+		err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: namespace}, &cluster)
+		assert.NoError(t, err)
+		cluster.Spec.Security.CephX.Daemon = cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     2,
+		}
+		err = cl.Update(ctx, &cluster)
+		assert.NoError(t, err)
+
+		rotatedKeyJson = `[{"key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=="}]`
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, calledCommitConfigChanges)
+
+		oStore := cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(2), oStore.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", oStore.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err = clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-rgw-"+store+"-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, secret.StringData["keyring"], "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==")
+	})
+
+	t.Run("brownfield reconcile - no further rotation happens", func(t *testing.T) {
+		// if rotation happens when it shouldn't, this will let us know by later comparison
+		rotatedKeyJson = `[{"key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=="}]`
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, calledCommitConfigChanges)
+
+		oStore := cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(2), oStore.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", oStore.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err = clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-rgw-"+store+"-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		// code path should use 'auth get-or-create' which doesn't return BBBB... or CCCC..., so just ensure it's not CCCC...
+		assert.NotContains(t, secret.StringData["keyring"], "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==")
+	})
+
+	t.Run("rotate key - cephx status updated", func(t *testing.T) {
+		cluster := cephv1.CephCluster{}
+		err = cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: namespace}, &cluster)
+		assert.NoError(t, err)
+		cluster.Spec.Security.CephX.Daemon = cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     4,
+		}
+		err = cl.Update(ctx, &cluster)
+		assert.NoError(t, err)
+
+		rotatedKeyJson = `[{"key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=="}]`
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, calledCommitConfigChanges)
+
+		oStore := cephv1.CephObjectStore{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(4), oStore.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", oStore.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err = clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-rgw-"+store+"-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, secret.StringData["keyring"], "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==")
+	})
 }

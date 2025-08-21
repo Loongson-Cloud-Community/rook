@@ -26,10 +26,12 @@ import (
 	testexec "github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	k8stesting "k8s.io/client-go/testing"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestPrepareDeviceSets(t *testing.T) {
@@ -51,7 +53,7 @@ func testPrepareDeviceSets(t *testing.T, setTemplateName bool) {
 		Name:                 "mydata",
 		Count:                1,
 		Portable:             true,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{claim},
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{claim},
 		SchedulerName:        "custom-scheduler",
 	}
 	spec := cephv1.ClusterSpec{
@@ -83,6 +85,14 @@ func testPrepareDeviceSets(t *testing.T, setTemplateName bool) {
 	}
 	assert.Equal(t, fmt.Sprintf("mydata-%s-0", expectedName), pvcs.Items[0].GenerateName)
 	assert.Equal(t, cluster.clusterInfo.Namespace, pvcs.Items[0].Namespace)
+
+	// Verify that the PVC has correct Image Version Label
+	cephImageVersion := createValidImageVersionLabel(cluster.spec.CephVersion.Image)
+	for _, item := range pvcs.Items {
+		val, exist := item.Labels[CephImageLabelKey]
+		assert.Equal(t, true, exist)
+		assert.Equal(t, cephImageVersion, val)
+	}
 }
 
 func TestPrepareDeviceSetWithHolesInPVCs(t *testing.T) {
@@ -96,7 +106,7 @@ func TestPrepareDeviceSetWithHolesInPVCs(t *testing.T) {
 		Name:                 "mydata",
 		Count:                1,
 		Portable:             true,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{testVolumeClaim("data"), testVolumeClaim("metadata"), testVolumeClaim("wal")},
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{testVolumeClaim("data"), testVolumeClaim("metadata"), testVolumeClaim("wal")},
 		SchedulerName:        "custom-scheduler",
 	}
 	spec := cephv1.ClusterSpec{
@@ -223,9 +233,9 @@ func assertPVCExists(t *testing.T, clientset kubernetes.Interface, namespace, na
 	assert.NotNil(t, pvc)
 }
 
-func testVolumeClaim(name string) corev1.PersistentVolumeClaim {
+func testVolumeClaim(name string) cephv1.VolumeClaimTemplate {
 	storageClass := "mysource"
-	claim := corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{
+	claim := cephv1.VolumeClaimTemplate{Spec: corev1.PersistentVolumeClaimSpec{
 		StorageClassName: &storageClass,
 	}}
 	claim.Name = name
@@ -241,7 +251,7 @@ func TestPrepareDeviceSetsWithCrushParams(t *testing.T) {
 	deviceSet := cephv1.StorageClassDeviceSet{
 		Name:                 "datawithcrushparams1",
 		Count:                1,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{testVolumeClaim("testwithcrushparams1")},
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{testVolumeClaim("testwithcrushparams1")},
 		SchedulerName:        "custom-scheduler",
 	}
 	deviceSet.VolumeClaimTemplates[0].Annotations = map[string]string{
@@ -283,4 +293,38 @@ func TestPVCName(t *testing.T) {
 
 	id = deviceSetPVCID("device.set.with.dots", "b", 10)
 	assert.Equal(t, "device-set-with-dots-b-10", id)
+}
+
+func TestCreateValidImageVersionLabel(t *testing.T) {
+	image := "ceph/ceph:v19.2.0"
+	assert.Equal(t, "ceph_ceph_v19.2.0", createValidImageVersionLabel(image))
+	image = "rook/ceph:master"
+	assert.Equal(t, "rook_ceph_master", createValidImageVersionLabel(image))
+	image = ".invalid_label"
+	assert.Equal(t, "", createValidImageVersionLabel(image))
+}
+
+func TestCheckAllPvcResize(t *testing.T) {
+	ctx := context.TODO()
+	s := runtime.NewScheme()
+	_ = corev1.AddToScheme(s)
+	client := clientfake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(&corev1.PersistentVolumeClaim{}).WithStatusSubresource(&corev1.PersistentVolumeClaim{}).Build()
+	namespace := "testns"
+	pvcResizeMap := make(map[string]pvcResize)
+
+	pvcResizeMap["pvc1"] = pvcResize{
+		desiredSize:     resource.MustParse("10Gi"),
+		actualSize:      resource.MustParse("5Gi"),
+		resizeConfirmed: false,
+	}
+
+	assert.False(t, checkAllPvcResize(ctx, client, namespace, pvcResizeMap))
+
+	pvcResizeMap["pvc1"] = pvcResize{
+		desiredSize:     resource.MustParse("10Gi"),
+		actualSize:      resource.MustParse("10Gi"),
+		resizeConfirmed: true,
+	}
+
+	assert.True(t, checkAllPvcResize(ctx, client, namespace, pvcResizeMap))
 }

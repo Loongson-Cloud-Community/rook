@@ -19,7 +19,6 @@ package client
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -109,9 +108,8 @@ func GenerateConnectionConfigWithSettings(context *clusterd.Context, clusterInfo
 
 // generateConfigFile generates and writes a config file to disk.
 func generateConfigFile(context *clusterd.Context, clusterInfo *ClusterInfo, pathRoot, keyringPath string, globalConfig *CephConfig, clientSettings map[string]string) (string, error) {
-
 	// create the config directory
-	if err := os.MkdirAll(pathRoot, 0744); err != nil {
+	if err := os.MkdirAll(pathRoot, 0o744); err != nil {
 		return "", errors.Wrapf(err, "failed to create config directory at %q", pathRoot)
 	}
 
@@ -178,7 +176,6 @@ func getQualifiedUser(user string) string {
 
 // CreateDefaultCephConfig creates a default ceph config file.
 func CreateDefaultCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo) (*CephConfig, error) {
-
 	cephVersionEnv := os.Getenv("ROOK_CEPH_VERSION")
 	if cephVersionEnv != "" {
 		v, err := cephver.ExtractCephVersion(cephVersionEnv)
@@ -205,7 +202,6 @@ func CreateDefaultCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo
 
 // create a config file with global settings configured, and return an ini file
 func createGlobalConfigFileSection(context *clusterd.Context, clusterInfo *ClusterInfo, userConfig *CephConfig) (*ini.File, error) {
-
 	var ceph *CephConfig
 
 	if userConfig != nil {
@@ -250,23 +246,21 @@ func PopulateMonHostMembers(clusterInfo *ClusterInfo) ([]string, []string) {
 	var monMembers []string
 	var monHosts []string
 
-	for _, monitor := range clusterInfo.Monitors {
+	for _, monitor := range clusterInfo.AllMonitors() {
 		if monitor.OutOfQuorum {
 			logger.Warningf("skipping adding mon %q to config file, detected out of quorum", monitor.Name)
 			continue
 		}
 		monMembers = append(monMembers, monitor.Name)
 		monIP := cephutil.GetIPFromEndpoint(monitor.Endpoint)
-		if clusterInfo.RequireMsgr2 {
-			monHosts = append(monHosts, fmt.Sprintf("[v2:%s:%d]", monIP, Msgr2port))
+		// Detect the current port if the mon already exists
+		// so the same msgr1 port can be preserved if needed (6789 or 6790)
+		currentMonPort := cephutil.GetPortFromEndpoint(monitor.Endpoint)
+
+		if currentMonPort == Msgr2port {
+			msgr2Endpoint := net.JoinHostPort(monIP, strconv.Itoa(int(Msgr2port)))
+			monHosts = append(monHosts, "[v2:"+msgr2Endpoint+"]")
 		} else {
-			// Detect the current port if the mon already exists
-			// so the same msgr1 port can be preserved if needed (6789 or 6790)
-			currentMonPort := cephutil.GetPortFromEndpoint(monitor.Endpoint)
-			// Ensure we're setting a msgr1 port, rather than duplicating msgr2
-			if currentMonPort == Msgr2port {
-				currentMonPort = Msgr1port
-			}
 			msgr2Endpoint := net.JoinHostPort(monIP, strconv.Itoa(int(Msgr2port)))
 			msgr1Endpoint := net.JoinHostPort(monIP, strconv.Itoa(int(currentMonPort)))
 			monHosts = append(monHosts, "[v2:"+msgr2Endpoint+",v1:"+msgr1Endpoint+"]")
@@ -289,15 +283,15 @@ func WriteCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo) error 
 	if err != nil {
 		return errors.Wrap(err, "failed to write connection config")
 	}
-	src, err := ioutil.ReadFile(filepath.Clean(confFilePath))
+	src, err := os.ReadFile(filepath.Clean(confFilePath))
 	if err != nil {
 		return errors.Wrap(err, "failed to copy connection config to /etc/ceph. failed to read the connection config")
 	}
-	err = ioutil.WriteFile(DefaultConfigFilePath(), src, 0600)
+	err = os.WriteFile(DefaultConfigFilePath(), src, 0o600)
 	if err != nil {
 		return errors.Wrapf(err, "failed to copy connection config to /etc/ceph. failed to write %q", DefaultConfigFilePath())
 	}
-	dst, err := ioutil.ReadFile(DefaultConfigFilePath())
+	dst, err := os.ReadFile(DefaultConfigFilePath())
 	if err == nil {
 		logger.Debugf("config file @ %s:\n%s", DefaultConfigFilePath(), dst)
 	} else {

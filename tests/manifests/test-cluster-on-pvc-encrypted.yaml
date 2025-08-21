@@ -14,7 +14,8 @@ spec:
           requests:
             storage: 5Gi
   cephVersion:
-    image: quay.io/ceph/ceph:v16
+    image: quay.io/ceph/ceph:v19.2.3
+    allowUnsupported: true
   dashboard:
     enabled: false
   network:

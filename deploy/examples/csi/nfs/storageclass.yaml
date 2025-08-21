@@ -2,8 +2,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: rook-nfs
-# Change "rook-ceph" provisioner prefix to match the operator namespace if needed
-provisioner: rook-ceph.nfs.csi.ceph.com
+provisioner: rook-ceph.nfs.csi.ceph.com # csi-provisioner-name
 parameters:
   # nfsCluster is the name of the NFS cluster as managed by Ceph (sometimes called the NFS cluster ID).
   # With Rook, this should get the name of the CephNFS resource.
@@ -38,6 +37,8 @@ parameters:
   csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph # namespace:cluster
   csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
   csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph # namespace:cluster
+  csi.storage.k8s.io/controller-publish-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph # namespace:cluster
   csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
   csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph # namespace:cluster
 
