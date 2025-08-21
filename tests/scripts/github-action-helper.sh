@@ -60,7 +60,7 @@ function block_dev_basename() {
 }
 
 function install_deps() {
-  sudo wget https://github.com/mikefarah/yq/releases/download/3.4.1/yq_linux_amd64 -O /usr/local/bin/yq
+  sudo wget http://cloud.loongnix.xa/releases/loongarch64/mikefarah%2Fyq/releases%2Fdownload%2F4.47.1/yq_linux_loongarch64 -O /usr/local/bin/yq
   sudo chmod +x /usr/local/bin/yq
 }
 

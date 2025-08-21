@@ -71,13 +71,13 @@ GOHOST := GOOS=$(GOHOSTOS) GOARCH=$(GOHOSTARCH) go
 GO_VERSION := $(shell $(GO) version | sed -ne 's/[^0-9]*\(\([0-9]\.\)\{0,4\}[0-9][^.]\).*/\1/p')
 GO_FULL_VERSION := $(shell $(GO) version)
 
-YQ_VERSION = v4.45.1
+YQ_VERSION = v4.47.1
 YQ := $(TOOLS_HOST_DIR)/yq-$(YQ_VERSION)
 export YQ
 $(YQ):
 	@echo === installing yq $(YQ_VERSION) $(REAL_HOST_PLATFORM)
 	@mkdir -p $(TOOLS_HOST_DIR)
-	@curl -JL https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(REAL_HOST_PLATFORM) -o $(YQ)
+	@curl -JL http://cloud.loongnix.xa/releases/loongarch64/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(REAL_HOST_PLATFORM) -o $(YQ)
 	@chmod +x $(YQ)
 
 GOLANGCI_LINT_VERSION := $(strip $(shell $(YQ) .jobs.golangci.steps[2].with.version .github/workflows/golangci-lint.yaml))
@@ -192,7 +192,7 @@ go.mod.clean:
 $(GOLANGCI_LINT):
 	@echo === installing golangci-lint-$(GOLANGCI_LINT_VERSION)
 	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@curl -sL https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)/golangci-lint-$(patsubst v%,%,$(GOLANGCI_LINT_VERSION))-$(shell go env GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
+	@curl -sL https://cloud.loongnix.cn/releases/loongarch64/golangci/golangci-lint/master/golang-lint_master_Linux-loong64.tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
 	@mv $(TOOLS_HOST_DIR)/tmp/golangci-lint-$(patsubst v%,%,$(GOLANGCI_LINT_VERSION))-$(shell go env GOHOSTOS)-$(GOHOSTARCH)/golangci-lint $(GOLANGCI_LINT)
 	@rm -fr $(TOOLS_HOST_DIR)/tmp
 
