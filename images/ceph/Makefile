@@ -16,9 +16,11 @@ include ../image.mk
 
 # ====================================================================================
 # Image Build Options
-CEPH_VERSION ?= v19.2.3-20250717
+#CEPH_VERSION ?= v19.2.3-20250717
+CEPH_VERSION ?= 18.2.2
 
-REGISTRY_NAME = quay.io
+#REGISTRY_NAME = quay.io
+REGISTRY_NAME = lcr.loongnix.cn
 BASEIMAGE = $(REGISTRY_NAME)/ceph/ceph:$(CEPH_VERSION)
 CEPH_IMAGE = $(BUILD_REGISTRY)/ceph-$(GOARCH)
 OPERATOR_SDK_VERSION = v1.25.0

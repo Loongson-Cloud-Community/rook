@@ -31,7 +31,7 @@ $(HELM_OUTPUT_DIR):
 $(HELM):
 	@echo === installing helm
 	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@curl -sL https://get.helm.sh/helm-$(HELM_VERSION)-$(shell go env GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
+	@curl -sL http://cloud.loongnix.xa/releases/loongarch64/helm/helm/3.18.2/helm-$(HELM_VERSION)-$(shell go env GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
 	@mv $(TOOLS_HOST_DIR)/tmp/$(shell go env GOHOSTOS)-$(GOHOSTARCH)/helm $(HELM)
 	@rm -fr $(TOOLS_HOST_DIR)/tmp
 

@@ -28,6 +28,8 @@ ifeq ($(GOARCH),amd64)
 PLATFORM_ARCH = x86_64
 else ifeq ($(GOARCH),arm64)
 PLATFORM_ARCH = aarch64
+else ifeq ($(GOARCH),loong64)
+PLATFORM_ARCH = loong64
 else
 $(error Unknown go architecture $(GOARCH))
 endif
