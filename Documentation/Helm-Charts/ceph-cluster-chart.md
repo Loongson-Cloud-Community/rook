@@ -16,8 +16,7 @@ This chart is a simple packaging of templates that will optionally create Rook r
 
 ## Prerequisites
 
-* Kubernetes 1.19+
-* Helm 3.x
+* Helm 3.13+
 * Install the [Rook Operator chart](operator-chart.md)
 
 ## Installing
@@ -26,8 +25,6 @@ The `helm install` command deploys rook on the Kubernetes cluster in the default
 The [configuration](#configuration) section lists the parameters that can be configured during installation. It is
 recommended that the rook operator be installed into the `rook-ceph` namespace. The clusters can be installed
 into the same namespace as the operator or a separate namespace.
-
-Rook currently publishes builds of this chart to the `release` and `master` channels.
 
 **Before installing, review the values.yaml to confirm if the default settings need to be updated.**
 
@@ -41,16 +38,19 @@ Rook currently publishes builds of this chart to the `release` and `master` chan
 
 ### **Release**
 
-The release channel is the most recent release of Rook that is considered stable for the community.
+The `release` channel is the most recent release of Rook that is considered stable for the community.
 
 The example install assumes you have first installed the [Rook Operator Helm Chart](operator-chart.md)
-and created your customized values-override.yaml.
+and created your customized values.yaml.
 
 ```console
 helm repo add rook-release https://charts.rook.io/release
 helm install --create-namespace --namespace rook-ceph rook-ceph-cluster \
-   --set operatorNamespace=rook-ceph rook-release/rook-ceph-cluster -f values-override.yaml
+   --set operatorNamespace=rook-ceph rook-release/rook-ceph-cluster -f values.yaml
 ```
+
+!!! Note
+    --namespace specifies the cephcluster namespace, which may be different from the rook operator namespace.
 
 ## Configuration
 
@@ -66,26 +66,38 @@ The following table lists the configurable parameters of the rook-operator chart
 | `cephObjectStores` | A list of CephObjectStore configurations to deploy | See [below](#ceph-object-stores) |
 | `clusterName` | The metadata.name of the CephCluster CR | The same as the namespace |
 | `configOverride` | Cluster ceph.conf override | `nil` |
+| `csiDriverNamePrefix` | CSI driver name prefix for cephfs, rbd and nfs. | `namespace name where rook-ceph operator is deployed` |
 | `ingress.dashboard` | Enable an ingress for the ceph-dashboard | `{}` |
 | `kubeVersion` | Optional override of the target kubernetes version | `nil` |
 | `monitoring.createPrometheusRules` | Whether to create the Prometheus rules for Ceph alerts | `false` |
 | `monitoring.enabled` | Enable Prometheus integration, will also create necessary RBAC rules to allow Operator to create ServiceMonitors. Monitoring requires Prometheus to be pre-installed | `false` |
+| `monitoring.metricsDisabled` | Whether to disable the metrics reported by Ceph. If false, the prometheus mgr module and Ceph exporter are enabled | `false` |
 | `monitoring.prometheusRule.annotations` | Annotations applied to PrometheusRule | `{}` |
 | `monitoring.prometheusRule.labels` | Labels applied to PrometheusRule | `{}` |
-| `monitoring.rulesNamespaceOverride` | The namespace in which to create the prometheus rules, if different from the rook cluster namespace If you have multiple rook-ceph clusters in the same k8s cluster, choose the same namespace (ideally, namespace with prometheus deployed) to set rulesNamespace for all the clusters. Otherwise, you will get duplicate alerts with multiple alert definitions. | `nil` |
+| `monitoring.prometheusRuleOverrides` | Edit Prometheus rules for Ceph alerts | `{}` |
+| `monitoring.rulesNamespaceOverride` | The namespace in which to create the prometheus rules, if different from the rook cluster namespace. If you have multiple rook-ceph clusters in the same k8s cluster, choose the same namespace (ideally, namespace with prometheus deployed) to set rulesNamespaceOverride for all the clusters. Otherwise, you will get duplicate alerts with multiple alert definitions. | `nil` |
 | `operatorNamespace` | Namespace of the main rook operator | `"rook-ceph"` |
 | `pspEnable` | Create & use PSP resources. Set this to the same value as the rook-ceph chart. | `false` |
+| `route.dashboard` | Enable an HTTPRoute for the ceph-dashboard | `{}` |
 | `toolbox.affinity` | Toolbox affinity | `{}` |
+| `toolbox.containerSecurityContext` | Toolbox container security context | `{"capabilities":{"drop":["ALL"]},"runAsGroup":2016,"runAsNonRoot":true,"runAsUser":2016}` |
 | `toolbox.enabled` | Enable Ceph debugging pod deployment. See [toolbox](../Troubleshooting/ceph-toolbox.md) | `false` |
-| `toolbox.image` | Toolbox image | `"rook/ceph:VERSION"` |
+| `toolbox.image` | Toolbox image, defaults to the image used by the Ceph cluster | `nil` |
+| `toolbox.labels` | Toolbox labels | `{}` |
 | `toolbox.priorityClassName` | Set the priority class for the toolbox if desired | `nil` |
-| `toolbox.resources` | Toolbox resources | `{"limits":{"cpu":"500m","memory":"1Gi"},"requests":{"cpu":"100m","memory":"128Mi"}}` |
+| `toolbox.resources` | Toolbox resources | `{"limits":{"memory":"1Gi"},"requests":{"cpu":"100m","memory":"128Mi"}}` |
 | `toolbox.tolerations` | Toolbox tolerations | `[]` |
 
 ### **Ceph Cluster Spec**
 
 The `CephCluster` CRD takes its spec from `cephClusterSpec.*`. This is not an exhaustive list of parameters.
 For the full list, see the [Cluster CRD](../CRDs/Cluster/ceph-cluster-crd.md) topic.
+
+The cluster spec example is for a converged cluster where all the Ceph daemons are running locally,
+as in the host-based example (cluster.yaml). For a different configuration such as a
+PVC-based cluster (cluster-on-pvc.yaml), external cluster (cluster-external.yaml),
+or stretch cluster (cluster-stretched.yaml), replace this entire `cephClusterSpec`
+with the specs from those examples.
 
 ### **Ceph Block Pools**
 
@@ -98,6 +110,8 @@ The `cephBlockPools` array in the values file will define a list of CephBlockPoo
 | `storageClass.enabled` | Whether a storage class is deployed alongside the CephBlockPool | `true` |
 | `storageClass.isDefault` | Whether the storage class will be the default storage class for PVCs. See [PersistentVolumeClaim documentation](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#persistentvolumeclaims) for details. | `true` |
 | `storageClass.name` | The name of the storage class | `ceph-block` |
+| `storageClass.annotations` | Additional storage class annotations | `{}` |
+| `storageClass.labels` | Additional storage class labels | `{}` |
 | `storageClass.parameters` | See [Block Storage](../Storage-Configuration/Block-Storage-RBD/block-storage.md) documentation or the helm values.yaml for suitable values | see values.yaml |
 | `storageClass.reclaimPolicy` | The default [Reclaim Policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy) to apply to PVCs created with this storage class. | `Delete` |
 | `storageClass.allowVolumeExpansion` | Whether [volume expansion](https://kubernetes.io/docs/concepts/storage/storage-classes/#allow-volume-expansion) is allowed by default. | `true` |
@@ -114,6 +128,8 @@ The `cephFileSystems` array in the values file will define a list of CephFileSys
 | `spec` | The CephFileSystem spec, see the [CephFilesystem CRD](../CRDs/Shared-Filesystem/ceph-filesystem-crd.md) documentation. | see values.yaml |
 | `storageClass.enabled` | Whether a storage class is deployed alongside the CephFileSystem | `true` |
 | `storageClass.name` | The name of the storage class | `ceph-filesystem` |
+| `storageClass.annotations` | Additional storage class annotations | `{}` |
+| `storageClass.labels` | Additional storage class labels | `{}` |
 | `storageClass.pool` | The name of [Data Pool](../CRDs/Shared-Filesystem/ceph-filesystem-crd.md#pools), without the filesystem name prefix | `data0` |
 | `storageClass.parameters` | See [Shared Filesystem](../Storage-Configuration/Shared-Filesystem-CephFS/filesystem-storage.md) documentation or the helm values.yaml for suitable values | see values.yaml |
 | `storageClass.reclaimPolicy` | The default [Reclaim Policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy) to apply to PVCs created with this storage class. | `Delete` |
@@ -129,8 +145,16 @@ The `cephObjectStores` array in the values file will define a list of CephObject
 | `spec` | The CephObjectStore spec, see the [CephObjectStore CRD](../CRDs/Object-Storage/ceph-object-store-crd.md) documentation. | see values.yaml |
 | `storageClass.enabled` | Whether a storage class is deployed alongside the CephObjectStore | `true` |
 | `storageClass.name` | The name of the storage class | `ceph-bucket` |
+| `storageClass.annotations` | Additional storage class annotations | `{}` |
+| `storageClass.labels` | Additional storage class labels | `{}` |
 | `storageClass.parameters` | See [Object Store storage class](../Storage-Configuration/Object-Storage-RGW/ceph-object-bucket-claim.md) documentation or the helm values.yaml for suitable values | see values.yaml |
 | `storageClass.reclaimPolicy` | The default [Reclaim Policy](https://kubernetes.io/docs/concepts/storage/storage-classes/#reclaim-policy) to apply to PVCs created with this storage class. | `Delete` |
+| `ingress.enabled` | Enable an ingress for the object store | `false` |
+| `ingress.annotations` | Ingress annotations | `{}` |
+| `ingress.host.name` | Ingress hostname | `""` |
+| `ingress.host.path` | Ingress path prefix | `/` |
+| `ingress.tls` | Ingress tls | `/` |
+| `ingress.ingressClassName` | Ingress tls | `""` |
 
 ### **Existing Clusters**
 
@@ -138,7 +162,7 @@ If you have an existing CephCluster CR that was created without the helm chart a
 chart to start managing the cluster:
 
 1. Extract the `spec` section of your existing CephCluster CR and copy to the `cephClusterSpec`
-   section in `values-override.yaml`.
+   section in `values.yaml`.
 
 2. Add the following annotations and label to your existing CephCluster CR:
 
@@ -152,16 +176,19 @@ chart to start managing the cluster:
 
 1. Run the `helm install` command in the [Installing section](#release) to create the chart.
 
-2. In the future when updates to the cluster are needed, ensure the values-override.yaml always
+2. In the future when updates to the cluster are needed, ensure the values.yaml always
    contains the desired CephCluster spec.
 
 ### **Development Build**
 
-To deploy from a local build from your development environment:
+To deploy from a local build from your development environment there are two steps:
+
+1. [Deploy the operator chart](operator-chart.md#development-build), in particular to get the CRDs.
+2. Deploy the cluster chart:
 
 ```console
 cd deploy/charts/rook-ceph-cluster
-helm install --create-namespace --namespace rook-ceph rook-ceph-cluster -f values-override.yaml .
+helm install --create-namespace --namespace rook-ceph rook-ceph-cluster -f values.yaml .
 ```
 
 ## Uninstalling the Chart

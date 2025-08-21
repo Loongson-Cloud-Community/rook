@@ -40,11 +40,11 @@ func DefaultFlags(fsid, mountedKeyringPath string) []string {
 func LoggingFlags() []string {
 	return []string{
 		// For containers, we're expected to log everything to stderr
-		NewFlag("log-to-stderr", "true"),
-		NewFlag("err-to-stderr", "true"),
-		NewFlag("mon-cluster-log-to-stderr", "true"),
+		NewFlag("default-log-to-stderr", "true"),
+		NewFlag("default-err-to-stderr", "true"),
+		NewFlag("default-mon-cluster-log-to-stderr", "true"),
 		// differentiate debug text from audit text, and the space after 'debug' is critical
-		NewFlag("log-stderr-prefix", "debug "),
+		NewFlag("default-log-stderr-prefix", "debug "),
 		NewFlag("default-log-to-file", "false"),
 		NewFlag("default-mon-cluster-log-to-file", "false"),
 	}
@@ -57,11 +57,6 @@ func DefaultCentralizedConfigs(cephVersion version.CephVersion) map[string]strin
 		"mon allow pool delete":   "true",
 		"mon cluster log file":    "",
 		"mon allow pool size one": "true",
-	}
-
-	// Every release before Quincy will enable PG auto repair on Bluestore OSDs
-	if !cephVersion.IsAtLeastQuincy() {
-		overrides["osd scrub auto repair"] = "true"
 	}
 
 	return overrides

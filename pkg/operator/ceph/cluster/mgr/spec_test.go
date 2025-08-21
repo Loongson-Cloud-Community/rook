@@ -23,7 +23,6 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
-	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/test"
 	optest "github.com/rook/rook/pkg/operator/test"
 	"github.com/stretchr/testify/assert"
@@ -41,16 +40,17 @@ func TestPodSpec(t *testing.T) {
 		Dashboard:          cephv1.DashboardSpec{Port: 1234},
 		PriorityClassNames: map[cephv1.KeyType]string{cephv1.KeyMgr: "my-priority-class"},
 		DataDirHostPath:    "/var/lib/rook/",
-		Resources: cephv1.ResourceSpec{string(cephv1.KeyMgr): v1.ResourceRequirements{
-			Limits: v1.ResourceList{
-				v1.ResourceCPU:    *resource.NewQuantity(200.0, resource.BinarySI),
-				v1.ResourceMemory: *resource.NewQuantity(500.0, resource.BinarySI),
+		Resources: cephv1.ResourceSpec{
+			string(cephv1.KeyMgr): v1.ResourceRequirements{
+				Limits: v1.ResourceList{
+					v1.ResourceCPU:    *resource.NewQuantity(200.0, resource.BinarySI),
+					v1.ResourceMemory: *resource.NewQuantity(500.0, resource.BinarySI),
+				},
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    *resource.NewQuantity(100.0, resource.BinarySI),
+					v1.ResourceMemory: *resource.NewQuantity(250.0, resource.BinarySI),
+				},
 			},
-			Requests: v1.ResourceList{
-				v1.ResourceCPU:    *resource.NewQuantity(100.0, resource.BinarySI),
-				v1.ResourceMemory: *resource.NewQuantity(250.0, resource.BinarySI),
-			},
-		},
 		},
 	}
 	c := New(&clusterd.Context{Clientset: clientset}, clusterInfo, clusterSpec, "rook/rook:myversion")
@@ -71,6 +71,7 @@ func TestPodSpec(t *testing.T) {
 
 		podTemplate := test.NewPodTemplateSpecTester(t, &d.Spec.Template)
 		podTemplate.Spec().Containers().RequireAdditionalEnvVars(
+			"CEPH_ARGS",
 			"ROOK_OPERATOR_NAMESPACE", "ROOK_CEPH_CLUSTER_CRD_VERSION",
 			"ROOK_CEPH_CLUSTER_CRD_NAME")
 		podTemplate.RunFullSuite(config.MgrType, "a", AppName, "ns", "quay.io/ceph/ceph:myceph",
@@ -78,7 +79,7 @@ func TestPodSpec(t *testing.T) {
 			"my-priority-class", "test", "cephclusters.ceph.rook.io", "ceph-mgr")
 		assert.Equal(t, 2, len(d.Spec.Template.Annotations))
 		assert.Equal(t, 1, len(d.Spec.Template.Spec.Containers))
-		assert.Equal(t, 5, len(d.Spec.Template.Spec.Containers[0].VolumeMounts))
+		assert.Equal(t, 6, len(d.Spec.Template.Spec.Containers[0].VolumeMounts))
 	})
 
 	t.Run("deployment with multus with new sidecar proxy command container", func(t *testing.T) {
@@ -88,7 +89,7 @@ func TestPodSpec(t *testing.T) {
 		assert.Equal(t, 3, len(d.Spec.Template.Annotations))                                                                                                                              // Multus annotations
 		assert.Equal(t, 2, len(d.Spec.Template.Spec.Containers))                                                                                                                          // mgr pod + sidecar
 		assert.Equal(t, cephclient.CommandProxyInitContainerName, d.Spec.Template.Spec.Containers[1].Name)                                                                                // sidecar pod
-		assert.Equal(t, 6, len(d.Spec.Template.Spec.Containers[1].VolumeMounts))                                                                                                          // + admin keyring
+		assert.Equal(t, 7, len(d.Spec.Template.Spec.Containers[1].VolumeMounts))                                                                                                          // + admin keyring
 		assert.Equal(t, "CEPH_ARGS", d.Spec.Template.Spec.Containers[1].Env[len(d.Spec.Template.Spec.Containers[1].Env)-1].Name)                                                          // connection info to the cluster
 		assert.Equal(t, "-m $(ROOK_CEPH_MON_HOST) -k /etc/ceph/admin-keyring-store/keyring", d.Spec.Template.Spec.Containers[1].Env[len(d.Spec.Template.Spec.Containers[1].Env)-1].Value) // connection info to the cluster
 	})
@@ -113,14 +114,17 @@ func TestServiceSpec(t *testing.T) {
 	clusterSpec := cephv1.ClusterSpec{}
 	c := New(&clusterd.Context{Clientset: clientset}, clusterInfo, clusterSpec, "myversion")
 
-	s, err := c.MakeMetricsService("rook-mgr", "foo", serviceMetricName)
+	s, err := c.MakeMetricsService("rook-mgr", serviceMetricName)
 	assert.NoError(t, err)
 	assert.NotNil(t, s)
 	assert.Equal(t, "rook-mgr", s.Name)
 	assert.Equal(t, 1, len(s.Spec.Ports))
-	assert.Equal(t, 3, len(s.Labels))
+	assert.Equal(t, 2, len(s.Labels))
+	// Check service selector
 	assert.Equal(t, 3, len(s.Spec.Selector))
-	assert.Equal(t, "foo", s.Spec.Selector[controller.DaemonIDLabel])
+	assert.Equal(t, s.Spec.Selector["app"], "rook-ceph-mgr")
+	assert.Equal(t, s.Spec.Selector["mgr_role"], "active")
+	assert.Equal(t, s.Spec.Selector["rook_cluster"], "ns")
 }
 
 func TestHostNetwork(t *testing.T) {

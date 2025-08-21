@@ -73,16 +73,16 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 	s.poolName = "multi-cluster-pool1"
 	coreNamespace := "multi-core"
 	s.settings = &installer.TestCephSettings{
-		ClusterName:               "multi-cluster",
-		Namespace:                 coreNamespace,
-		OperatorNamespace:         installer.SystemNamespace(coreNamespace),
-		StorageClassName:          "manual",
-		UsePVC:                    installer.UsePVC(),
-		Mons:                      1,
-		MultipleMgrs:              true,
-		EnableAdmissionController: true,
-		RookVersion:               installer.LocalBuildTag,
-		CephVersion:               installer.PacificVersion,
+		ClusterName:       "multi-cluster",
+		Namespace:         coreNamespace,
+		OperatorNamespace: installer.SystemNamespace(coreNamespace),
+		StorageClassName:  "manual",
+		UsePVC:            installer.UsePVC(),
+		Mons:              1,
+		MultipleMgrs:      true,
+		RookVersion:       installer.LocalBuildTag,
+		CephVersion:       installer.SquidVersion,
+		RequireMsgr2:      true,
 	}
 	s.settings.ApplyEnvVars()
 	externalSettings := &installer.TestCephSettings{
@@ -91,6 +91,7 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 		Namespace:         "multi-external",
 		OperatorNamespace: s.settings.OperatorNamespace,
 		RookVersion:       s.settings.RookVersion,
+		CephVersion:       installer.SquidVersion,
 	}
 	externalSettings.ApplyEnvVars()
 	s.externalManifests = installer.NewCephManifests(externalSettings)
@@ -149,8 +150,10 @@ func (s *MultiClusterDeploySuite) TestInstallingMultipleRookClusters() {
 func (s *MultiClusterDeploySuite) setupMultiClusterCore() {
 	root, err := utils.FindRookRoot()
 	require.NoError(s.T(), err, "failed to get rook root")
-	cmdArgs := utils.CommandArgs{Command: filepath.Join(root, localPathPVCmd),
-		CmdArgs: []string{installer.TestScratchDevice()}}
+	cmdArgs := utils.CommandArgs{
+		Command: filepath.Join(root, localPathPVCmd),
+		CmdArgs: []string{installer.TestScratchDevice()},
+	}
 	cmdOut := utils.ExecuteCommand(cmdArgs)
 	require.NoError(s.T(), cmdOut.Err)
 

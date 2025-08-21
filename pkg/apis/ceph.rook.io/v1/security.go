@@ -24,9 +24,7 @@ import (
 	"github.com/libopenstorage/secrets/vault"
 )
 
-var (
-	VaultTLSConnectionDetails = []string{api.EnvVaultCACert, api.EnvVaultClientCert, api.EnvVaultClientKey}
-)
+var VaultTLSConnectionDetails = []string{api.EnvVaultCACert, api.EnvVaultClientCert, api.EnvVaultClientKey}
 
 // IsEnabled return whether a KMS is configured
 func (kms *KeyManagementServiceSpec) IsEnabled() bool {
@@ -46,6 +44,10 @@ func (kms *KeyManagementServiceSpec) IsK8sAuthEnabled() bool {
 // IsVaultKMS return whether Vault KMS is configured
 func (kms *KeyManagementServiceSpec) IsVaultKMS() bool {
 	return getParam(kms.ConnectionDetails, "KMS_PROVIDER") == secrets.TypeVault
+}
+
+func (kms *KeyManagementServiceSpec) IsAzureMS() bool {
+	return getParam(kms.ConnectionDetails, "KMS_PROVIDER") == secrets.TypeAzure
 }
 
 // IsIBMKeyProtectKMS return whether IBM Key Protect KMS is configured

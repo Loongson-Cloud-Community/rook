@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -29,10 +29,11 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	oposd "github.com/rook/rook/pkg/operator/ceph/cluster/osd"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/ceph/cluster/osd/config"
 	"github.com/rook/rook/pkg/util/display"
 	"github.com/rook/rook/pkg/util/sys"
 )
@@ -45,6 +46,10 @@ const (
 	dbDeviceFlag         = "--db-devices"
 	cephVolumeCmd        = "ceph-volume"
 	cephVolumeMinDBSize  = 1024 // 1GB
+
+	blockDBFlag     = "--block.db"
+	blockDBSizeFlag = "--block.db-size"
+	dataFlag        = "--data"
 )
 
 // These are not constants because they are used by the tests
@@ -54,19 +59,18 @@ var (
 	lvmConfPath   = "/etc/lvm/lvm.conf"
 	cvLogDir      = ""
 
-	// The mitigation of phantom ATARI partition problem is fixed in Ceph v16.2.6. Quincy doesn't have this problem from the beginning
-	// See https://github.com/ceph/ceph/pull/42469
-	cephIgnorePhantomAtariPartitionCephVersion = cephver.CephVersion{Major: 16, Minor: 2, Extra: 6}
-	isEncrypted                                = os.Getenv(oposd.EncryptedDeviceEnvVarName) == "true"
-	isOnPVC                                    = os.Getenv(oposd.PVCBackedOSDVarName) == "true"
+	isEncrypted = os.Getenv(oposd.EncryptedDeviceEnvVarName) == "true"
+	isOnPVC     = os.Getenv(oposd.PVCBackedOSDVarName) == "true"
 )
 
 type osdInfoBlock struct {
-	CephFsid string `json:"ceph_fsid"`
-	Device   string `json:"device"`
-	OsdID    int    `json:"osd_id"`
-	OsdUUID  string `json:"osd_uuid"`
-	Type     string `json:"type"`
+	CephFsid  string `json:"ceph_fsid"`
+	Device    string `json:"device"`
+	DeviceDb  string `json:"device_db"`
+	DeviceWal string `json:"device_wal"`
+	OsdID     int    `json:"osd_id"`
+	OsdUUID   string `json:"osd_uuid"`
+	Type      string `json:"type"`
 }
 
 type osdInfo struct {
@@ -220,17 +224,17 @@ func (a *OsdAgent) initializeBlockPVC(context *clusterd.Context, devices *Device
 	// we need to return the block if raw mode is used and the lv if lvm mode
 	baseCommand := "stdbuf"
 	var baseArgs []string
+	storeFlag := a.storeConfig.GetStoreFlag()
 
 	// Create a specific log directory so that each prepare command will have its own log
 	// Only do this if nothing is present so that we don't override existing logs
 	cvLogDir = path.Join(cephLogDir, a.nodeName)
-	err := os.MkdirAll(cvLogDir, 0750)
+	err := os.MkdirAll(cvLogDir, 0o750)
 	if err != nil {
 		logger.Errorf("failed to create ceph-volume log directory %q, continue with default %q. %v", cvLogDir, cephLogDir, err)
-		baseArgs = []string{"-oL", cephVolumeCmd, "raw", "prepare", "--bluestore"}
+		baseArgs = []string{"-oL", cephVolumeCmd, "raw", "prepare", storeFlag}
 	} else {
-		// Always force Bluestore!
-		baseArgs = []string{"-oL", cephVolumeCmd, "--log-path", cvLogDir, "raw", "prepare", "--bluestore"}
+		baseArgs = []string{"-oL", cephVolumeCmd, "--log-path", cvLogDir, "raw", "prepare", storeFlag}
 	}
 
 	var metadataArg, walArg []string
@@ -254,7 +258,8 @@ func (a *OsdAgent) initializeBlockPVC(context *clusterd.Context, devices *Device
 		// This will make the devices.Entries larger than usual
 		if _, ok := devices.Entries["metadata"]; ok {
 			metadataDev = true
-			metadataArg = append(metadataArg, []string{"--block.db",
+			metadataArg = append(metadataArg, []string{
+				"--block.db",
 				devices.Entries["metadata"].Config.Name,
 			}...)
 
@@ -263,7 +268,8 @@ func (a *OsdAgent) initializeBlockPVC(context *clusterd.Context, devices *Device
 
 		if _, ok := devices.Entries["wal"]; ok {
 			walDev = true
-			walArg = append(walArg, []string{"--block.wal",
+			walArg = append(walArg, []string{
+				"--block.wal",
 				devices.Entries["wal"].Config.Name,
 			}...)
 
@@ -273,14 +279,23 @@ func (a *OsdAgent) initializeBlockPVC(context *clusterd.Context, devices *Device
 		if device.Data == -1 {
 			logger.Infof("configuring new device %q", device.Config.Name)
 			var err error
-			var deviceArg string
 
-			deviceArg = device.Config.Name
+			deviceArg := device.Config.Name
 
 			immediateExecuteArgs := append(baseArgs, []string{
 				"--data",
 				deviceArg,
 			}...)
+
+			if a.replaceOSD != nil {
+				replaceOSDID := a.GetReplaceOSDId(device.DeviceInfo.RealPath)
+				if replaceOSDID != -1 {
+					immediateExecuteArgs = append(immediateExecuteArgs, []string{
+						"--osd-id",
+						fmt.Sprintf("%d", replaceOSDID),
+					}...)
+				}
+			}
 
 			crushDeviceClass := os.Getenv(oposd.CrushDeviceClassVarName)
 			if crushDeviceClass != "" {
@@ -362,8 +377,7 @@ func getEncryptedBlockPath(op, blockType string) string {
 
 // UpdateLVMConfig updates the lvm.conf file
 func UpdateLVMConfig(context *clusterd.Context, onPVC, lvBackedPV bool) error {
-
-	input, err := ioutil.ReadFile(lvmConfPath)
+	input, err := os.ReadFile(lvmConfPath)
 	if err != nil {
 		return errors.Wrapf(err, "failed to read lvm config file %q", lvmConfPath)
 	}
@@ -392,7 +406,7 @@ func UpdateLVMConfig(context *clusterd.Context, onPVC, lvBackedPV bool) error {
 		}
 	}
 
-	if err = ioutil.WriteFile(lvmConfPath, output, 0600); err != nil {
+	if err = os.WriteFile(lvmConfPath, output, 0o600); err != nil {
 		return errors.Wrapf(err, "failed to update lvm config file %q", lvmConfPath)
 	}
 
@@ -431,15 +445,7 @@ func (a *OsdAgent) allowRawMode(context *clusterd.Context) (bool, error) {
 }
 
 // test if safe to use raw mode for a particular device
-func isSafeToUseRawMode(device *DeviceOsdIDEntry, cephVersion cephver.CephVersion) bool {
-	if device.DeviceInfo.Type == sys.DiskType {
-		// if this is a disk but the atari partition fix isn't in, we can't use raw mode
-		if !cephVersion.IsAtLeast(cephIgnorePhantomAtariPartitionCephVersion) {
-			logger.Debugf("won't use raw mode for disk %q since this is a disk and the atari partition issue isn't fixed", device.Config.Name)
-			return false
-		}
-	}
-
+func isSafeToUseRawMode(device *DeviceOsdIDEntry) bool {
 	// ceph-volume raw mode does not support more than one OSD per disk
 	if device.Config.OSDsPerDevice > 1 {
 		logger.Debugf("won't use raw mode for disk %q since osd per device is %d", device.Config.Name, device.Config.OSDsPerDevice)
@@ -449,6 +455,19 @@ func isSafeToUseRawMode(device *DeviceOsdIDEntry, cephVersion cephver.CephVersio
 	// ceph-volume raw mode does not support metadata device if not running on PVC because the user has specified a whole device
 	if device.Config.MetadataDevice != "" {
 		logger.Debugf("won't use raw mode for disk %q since this disk has a metadata device", device.Config.Name)
+		return false
+	}
+
+	return true
+}
+
+func lvmModeAllowed(device *DeviceOsdIDEntry, storeConfig *config.StoreConfig) bool {
+	if device.DeviceInfo.Type == sys.LVMType {
+		logger.Infof("skipping device %q for lvm mode since LVM logical volumes don't support `metadataDevice` or `osdsPerDevice` > 1", device.Config.Name)
+		return false
+	}
+	if device.DeviceInfo.Type == sys.PartType && storeConfig.EncryptedDevice {
+		logger.Infof("skipping partition %q for lvm mode since encryption is not supported on partitions with a `metadataDevice` or `osdsPerDevice > 1`", device.Config.Name)
 		return false
 	}
 
@@ -489,11 +508,13 @@ func (a *OsdAgent) initializeDevices(context *clusterd.Context, devices *DeviceO
 		// which reports only the phantom partitions (and malformed OSD info) when they exist and
 		// ignores the original (correct) OSDs created on the raw disk.
 		// See: https://github.com/rook/rook/issues/7940
-		if allowRawMode && isSafeToUseRawMode(device, a.clusterInfo.CephVersion) {
+		if allowRawMode && isSafeToUseRawMode(device) {
 			rawDevices.Entries[name] = device
 			continue
 		}
-		lvmDevices.Entries[name] = device
+		if lvmModeAllowed(device, &a.storeConfig) {
+			lvmDevices.Entries[name] = device
+		}
 	}
 
 	err = a.initializeDevicesRawMode(context, rawDevices)
@@ -512,7 +533,9 @@ func (a *OsdAgent) initializeDevices(context *clusterd.Context, devices *DeviceO
 func (a *OsdAgent) initializeDevicesRawMode(context *clusterd.Context, devices *DeviceOsdMapping) error {
 	baseCommand := "stdbuf"
 	cephVolumeMode := "raw"
-	baseArgs := []string{"-oL", cephVolumeCmd, cephVolumeMode, "prepare", "--bluestore"}
+	storeFlag := a.storeConfig.GetStoreFlag()
+
+	baseArgs := []string{"-oL", cephVolumeCmd, cephVolumeMode, "prepare", storeFlag}
 
 	for name, device := range devices.Entries {
 		deviceArg := path.Join("/dev", name)
@@ -523,6 +546,16 @@ func (a *OsdAgent) initializeDevicesRawMode(context *clusterd.Context, devices *
 				"--data",
 				deviceArg,
 			}...)
+
+			if a.replaceOSD != nil {
+				restoreOSDID := a.GetReplaceOSDId(deviceArg)
+				if restoreOSDID != -1 {
+					immediateExecuteArgs = append(immediateExecuteArgs, []string{
+						"--osd-id",
+						fmt.Sprintf("%d", restoreOSDID),
+					}...)
+				}
+			}
 
 			// assign the device class specific to the device
 			immediateExecuteArgs = a.appendDeviceClassArg(device, immediateExecuteArgs)
@@ -551,10 +584,9 @@ func (a *OsdAgent) initializeDevicesRawMode(context *clusterd.Context, devices *
 }
 
 func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *DeviceOsdMapping) error {
-	storeFlag := "--bluestore"
-
+	storeFlag := a.storeConfig.GetStoreFlag()
 	logPath := "/tmp/ceph-log"
-	if err := os.MkdirAll(logPath, 0700); err != nil {
+	if err := os.MkdirAll(logPath, 0o700); err != nil {
 		return errors.Wrapf(err, "failed to create dir %q", logPath)
 	}
 
@@ -628,8 +660,14 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 					}
 					metadataDevices[md]["devices"] = deviceArg
 				}
+				if metadataDevice.Type == sys.PartType {
+					if a.metadataDevice != "" && device.Config.MetadataDevice == "" {
+						return errors.Errorf("Partition device %s can not be specified as metadataDevice in the global OSD configuration or in the node level OSD configuration", md)
+					}
+					metadataDevices[md]["part"] = "true" // ceph-volume lvm batch only supports disk and lvm
+				}
 				deviceDBSizeMB := getDatabaseSize(a.storeConfig.DatabaseSizeMB, device.Config.DatabaseSizeMB)
-				if storeFlag == "--bluestore" && deviceDBSizeMB > 0 {
+				if a.storeConfig.IsValidStoreType() && deviceDBSizeMB > 0 {
 					if deviceDBSizeMB < cephVolumeMinDBSize {
 						// ceph-volume will convert this value to ?G. It needs to be > 1G to invoke lvcreate.
 						logger.Infof("skipping databaseSizeMB setting (%d). For it should be larger than %dMB.", deviceDBSizeMB, cephVolumeMinDBSize)
@@ -684,71 +722,110 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 
 	for md, conf := range metadataDevices {
 
-		mdArgs := batchArgs
-		if _, ok := conf["osdsperdevice"]; ok {
-			mdArgs = append(mdArgs, []string{
-				osdsPerDeviceFlag,
-				conf["osdsperdevice"],
-			}...)
-		}
-		if _, ok := conf["deviceclass"]; ok {
-			mdArgs = append(mdArgs, []string{
-				crushDeviceClassFlag,
-				conf["deviceclass"],
-			}...)
-		}
-		if _, ok := conf["databasesizemb"]; ok {
-			mdArgs = append(mdArgs, []string{
-				databaseSizeFlag,
-				conf["databasesizemb"],
-			}...)
-		}
-		mdArgs = append(mdArgs, strings.Split(conf["devices"], " ")...)
-
 		// Do not change device names if udev persistent names are passed
 		mdPath := md
 		if !strings.HasPrefix(mdPath, "/dev") {
 			mdPath = path.Join("/dev", md)
 		}
 
-		mdArgs = append(mdArgs, []string{
-			dbDeviceFlag,
-			mdPath,
-		}...)
-
-		// Reporting
-		reportArgs := append(mdArgs, []string{
-			"--report",
-		}...)
-
-		if err := context.Executor.ExecuteCommand(baseCommand, reportArgs...); err != nil {
-			return errors.Wrap(err, "failed ceph-volume report") // fail return here as validation provided by ceph-volume
+		var hasPart bool
+		mdArgs := batchArgs
+		osdsPerDevice := 1
+		if part, ok := conf["part"]; ok && part == "true" {
+			hasPart = true
+		}
+		if hasPart {
+			// ceph-volume lvm prepare --data {vg/lv} --block.wal {partition} --block.db {/path/to/device}
+			baseArgs := []string{"-oL", cephVolumeCmd, "--log-path", logPath, "lvm", "prepare", storeFlag}
+			if a.storeConfig.EncryptedDevice {
+				baseArgs = append(baseArgs, encryptedFlag)
+			}
+			mdArgs = baseArgs
+			devices := strings.Split(conf["devices"], " ")
+			if len(devices) > 1 {
+				logger.Warningf("partition metadataDevice %s can only be used by one data device", md)
+			}
+			if _, ok := conf["osdsperdevice"]; ok {
+				logger.Warningf("`ceph-volume osd prepare` doesn't support multiple OSDs per device")
+			}
+			mdArgs = append(mdArgs, []string{
+				dataFlag,
+				devices[0],
+				blockDBFlag,
+				mdPath,
+			}...)
+			if _, ok := conf["databasesizemb"]; ok {
+				mdArgs = append(mdArgs, []string{
+					blockDBSizeFlag,
+					conf["databasesizemb"],
+				}...)
+			}
+		} else {
+			if _, ok := conf["osdsperdevice"]; ok {
+				mdArgs = append(mdArgs, []string{
+					osdsPerDeviceFlag,
+					conf["osdsperdevice"],
+				}...)
+				v, _ := strconv.Atoi(conf["osdsperdevice"])
+				if v > 1 {
+					osdsPerDevice = v
+				}
+			}
+			if _, ok := conf["databasesizemb"]; ok {
+				mdArgs = append(mdArgs, []string{
+					databaseSizeFlag,
+					conf["databasesizemb"],
+				}...)
+			}
+			mdArgs = append(mdArgs, strings.Split(conf["devices"], " ")...)
+			mdArgs = append(mdArgs, []string{
+				dbDeviceFlag,
+				mdPath,
+			}...)
 		}
 
-		reportArgs = append(reportArgs, []string{
-			"--format",
-			"json",
-		}...)
-
-		cvOut, err := context.Executor.ExecuteCommandWithOutput(baseCommand, reportArgs...)
-		if err != nil {
-			return errors.Wrapf(err, "failed ceph-volume json report: %s", cvOut) // fail return here as validation provided by ceph-volume
+		if _, ok := conf["deviceclass"]; ok {
+			mdArgs = append(mdArgs, []string{
+				crushDeviceClassFlag,
+				conf["deviceclass"],
+			}...)
 		}
 
-		logger.Debugf("ceph-volume reports: %+v", cvOut)
+		if !hasPart {
+			// Reporting
+			reportArgs := append(mdArgs, []string{
+				"--report",
+			}...)
 
-		var cvReports []cephVolReportV2
-		if err = json.Unmarshal([]byte(cvOut), &cvReports); err != nil {
-			return errors.Wrap(err, "failed to unmarshal ceph-volume report json")
-		}
+			if err := context.Executor.ExecuteCommand(baseCommand, reportArgs...); err != nil {
+				return errors.Wrap(err, "failed ceph-volume report") // fail return here as validation provided by ceph-volume
+			}
 
-		if len(strings.Split(conf["devices"], " ")) != len(cvReports) {
-			return errors.Errorf("failed to create enough required devices, required: %s, actual: %v", cvOut, cvReports)
-		}
+			reportArgs = append(reportArgs, []string{
+				"--format",
+				"json",
+			}...)
 
-		for _, report := range cvReports {
-			if report.BlockDB != mdPath && !strings.HasSuffix(mdPath, report.BlockDB) {
-				return errors.Errorf("wrong db device for %s, required: %s, actual: %s", report.Data, mdPath, report.BlockDB)
+			cvOut, err := context.Executor.ExecuteCommandWithOutput(baseCommand, reportArgs...)
+			if err != nil {
+				return errors.Wrapf(err, "failed ceph-volume json report: %s", cvOut) // fail return here as validation provided by ceph-volume
+			}
+
+			logger.Debugf("ceph-volume reports: %+v", cvOut)
+
+			var cvReports []cephVolReportV2
+			if err = json.Unmarshal([]byte(cvOut), &cvReports); err != nil {
+				return errors.Wrap(err, "failed to unmarshal ceph-volume report json")
+			}
+
+			if len(strings.Split(conf["devices"], " "))*osdsPerDevice != len(cvReports) {
+				return errors.Errorf("failed to create enough required devices, required: %s, actual: %v", cvOut, cvReports)
+			}
+
+			for _, report := range cvReports {
+				if report.BlockDB != mdPath && !strings.HasSuffix(mdPath, report.BlockDB) {
+					return errors.Errorf("wrong db device for %s, required: %s, actual: %s", report.Data, mdPath, report.BlockDB)
+				}
 			}
 		}
 
@@ -774,6 +851,89 @@ func (a *OsdAgent) appendDeviceClassArg(device *DeviceOsdIDEntry, args []string)
 		}...)
 	}
 	return args
+}
+
+// WipeDevicesFromOtherClusters wipes the OSD backed disks if they have metadata from a different ceph cluster.
+// The wiped disks can then be used to prepare OSDs for the current ceph cluster.
+func (a *OsdAgent) WipeDevicesFromOtherClusters(context *clusterd.Context) error {
+	args := []string{"raw", "list", "--format", "json"}
+
+	result, err := callCephVolume(context, args...)
+	if err != nil {
+		return errors.Wrapf(err, "failed to retrieve ceph-volume raw list results")
+	}
+
+	var existingOSDs map[string]osdInfoBlock
+	err = json.Unmarshal([]byte(result), &existingOSDs)
+	if err != nil {
+		return errors.Wrapf(err, "failed to unmarshal ceph-volume raw list results")
+	}
+
+	if len(existingOSDs) == 0 {
+		logger.Info("no existing OSDs were found. No disks to be wiped")
+		return nil
+	}
+
+	for _, existingOSD := range existingOSDs {
+		// Wipe the devices that will be used for preparing OSD but already have OSD metadata from another ceph cluster
+		if existingOSD.CephFsid != a.clusterInfo.FSID {
+			osdID := existingOSD.OsdID
+			deviceToWipe := existingOSD.Device
+			osdDisk, encryptedBlock, err := getOSDDiskToBeWiped(context, existingOSD.Device)
+			if err != nil {
+				return errors.Wrapf(err, "failed to get the actual device path to be wiped for existing OSD %d with path %q", osdID, osdDisk.RealPath)
+			}
+			if osdDisk != nil {
+				deviceToWipe := osdDisk.RealPath
+				if encryptedBlock != "" {
+					err = RemoveEncryptedDevice(context, encryptedBlock)
+					if err != nil {
+						logger.Warningf("failed to remove stale dm device %q: %q", encryptedBlock, err)
+						continue
+					}
+				}
+				logger.Infof("begin wiping OSD %d device %q belonging to a different ceph cluster %q ", osdID, deviceToWipe, existingOSD.CephFsid)
+				logger.Infof("zap OSD.%d on device path %q", osdID, deviceToWipe)
+				output, err := context.Executor.ExecuteCommandWithCombinedOutput("stdbuf", "-oL", cephVolumeCmd, "lvm", "zap", deviceToWipe)
+				if err != nil {
+					return errors.Wrapf(err, "failed to zap osd.%d path %q. %s.", osdID, deviceToWipe, output)
+				}
+				logger.Infof("ceph-volume output: %s", output)
+				logger.Infof("successfully zapped osd.%d path %q", osdID, deviceToWipe)
+				logger.Infof("completed wiping OSD %d device %q belonging to a different ceph cluster", osdID, deviceToWipe)
+				// Since the device is wiped clean, clear the stale filesystem reference on the disk so that the wiped disk is not filtered out for filesystem check.
+				osdDisk.Filesystem = ""
+			} else {
+				logger.Infof("skip wiping OSD %d device %q belonging to a different ceph cluster %q since not a desired device", osdID, deviceToWipe, existingOSD.CephFsid)
+			}
+		}
+	}
+
+	return nil
+}
+
+// getOSDDiskToBeWiped returns OSD disk path and the dmcrypt block in case of encrypted OSDs
+func getOSDDiskToBeWiped(context *clusterd.Context, existingOSDDevice string) (*sys.LocalDisk, string, error) {
+	var err error
+	var encryptedBlock string
+	// encrypted OSDs have /dev/mapper/* entries. Find the real device path in case of encrypted OSDs
+	if strings.Contains(existingOSDDevice, "mapper") {
+		encryptedBlock = existingOSDDevice
+		existingOSDDevice, err = GetBackingDeviceForEncryptedBlock(context, existingOSDDevice)
+		if err != nil {
+			logger.Warningf("failed to get actual device used for the dmcrypt block %q: %q", encryptedBlock, err)
+			return nil, "", nil
+		}
+		logger.Infof("%q is the actual disk behind the %q encrypted block", existingOSDDevice, encryptedBlock)
+	}
+
+	var osdDisk *sys.LocalDisk
+	for _, desiredDevice := range context.Devices {
+		if desiredDevice.RealPath == existingOSDDevice {
+			osdDisk = desiredDevice
+		}
+	}
+	return osdDisk, encryptedBlock, nil
 }
 
 func lvmPreReq(context *clusterd.Context) error {
@@ -859,6 +1019,12 @@ func GetCephVolumeLVMOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			lvPath = lv
 		}
 
+		// TODO: Don't read osd store type from env variable
+		osdStore := os.Getenv(oposd.OSDStoreTypeVarName)
+		if osdStore == "" {
+			osdStore = string(cephv1.StoreTypeBlueStore)
+		}
+
 		osd := oposd.OSDInfo{
 			ID:            id,
 			Cluster:       "ceph",
@@ -867,7 +1033,7 @@ func GetCephVolumeLVMOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			SkipLVRelease: skipLVRelease,
 			LVBackedPV:    lvBackedPV,
 			CVMode:        cvMode,
-			Store:         "bluestore",
+			Store:         osdStore,
 			DeviceClass:   osdDeviceClass,
 		}
 		osds = append(osds, osd)
@@ -888,7 +1054,7 @@ func readCVLogContent(cvLogFilePath string) string {
 	defer cvLogFile.Close()
 
 	// Read c-v log file
-	b, err := ioutil.ReadAll(cvLogFile)
+	b, err := io.ReadAll(cvLogFile)
 	if err != nil {
 		logger.Errorf("failed to read ceph-volume log file %q. %v", cvLogFilePath, err)
 		return ""
@@ -913,6 +1079,8 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 	// blockPath represents the path of the OSD block
 	// it can be the one passed from the function's call or discovered by the c-v list command
 	var blockPath string
+	var blockMetadataPath string
+	var blockWalPath string
 
 	// If block is passed, check if it's an encrypted device, this is needed to get the correct
 	// device path and populate the OSDInfo for that OSD
@@ -962,7 +1130,7 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 
 				target := oposd.EncryptionDMName(pvcName, oposd.DmcryptBlockType)
 				// remove stale dm device left by previous OSD.
-				err = removeEncryptedDevice(context, target)
+				err = RemoveEncryptedDevice(context, target)
 				if err != nil {
 					logger.Warningf("failed to remove stale dm device %q: %q", target, err)
 				}
@@ -1043,9 +1211,15 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 		// If no block is specified let's take the one we discovered
 		if setDevicePathFromList {
 			blockPath = osdInfo.Device
+			blockMetadataPath = osdInfo.DeviceDb
+			blockWalPath = osdInfo.DeviceWal
 		} else {
 			blockPath = block
+			blockMetadataPath = metadataBlock
+			blockWalPath = walBlock
 		}
+
+		osdStore := osdInfo.Type
 
 		osd := oposd.OSDInfo{
 			ID:      osdID,
@@ -1057,12 +1231,12 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			// Thus in the activation sequence we might activate the wrong OSD and have OSDInfo messed up
 			// Hence, let's use the PVC name instead which will always remain consistent
 			BlockPath:     blockPath,
-			MetadataPath:  metadataBlock,
-			WalPath:       walBlock,
+			MetadataPath:  blockMetadataPath,
+			WalPath:       blockWalPath,
 			SkipLVRelease: true,
 			LVBackedPV:    lvBackedPV,
 			CVMode:        cvMode,
-			Store:         "bluestore",
+			Store:         osdStore,
 			Encrypted:     strings.Contains(blockPath, "-dmcrypt"),
 		}
 
@@ -1071,7 +1245,12 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to get device info for %q", blockPath)
 			}
-			osd.DeviceClass = sys.GetDiskDeviceClass(diskInfo)
+			deviceType := sys.GetDiskDeviceType(diskInfo)
+			osd.DeviceType = deviceType
+			logger.Infof("setting device type %q for device %q", osd.DeviceType, diskInfo.Name)
+
+			crushDeviceClass := sys.GetDiskDeviceClass(oposd.CrushDeviceClassVarName, deviceType)
+			osd.DeviceClass = crushDeviceClass
 			logger.Infof("setting device class %q for device %q", osd.DeviceClass, diskInfo.Name)
 		}
 
@@ -1085,7 +1264,7 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 		// pod
 		// For the cleanup pod we don't want to close the encrypted block since it will sanitize it
 		// first and then close it
-		if os.Getenv(oposd.CephVolumeEncryptedKeyEnvVarName) != "" {
+		if osd.Encrypted && os.Getenv(oposd.CephVolumeEncryptedKeyEnvVarName) != "" {
 			// If label and subsystem are not set on the encrypted block let's set it
 			// They will be set if the OSD deployment has been removed manually and the prepare job
 			// runs again.
@@ -1100,9 +1279,11 @@ func GetCephVolumeRawOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			}
 
 			// Close encrypted device
-			err = CloseEncryptedDevice(context, block)
-			if err != nil {
-				return nil, errors.Wrapf(err, "failed to close encrypted device %q for osd %d", block, osdID)
+			if block != "" {
+				err = CloseEncryptedDevice(context, block)
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed to close encrypted device %q for osd %d", block, osdID)
+				}
 			}
 
 			// If there is a metadata block
@@ -1141,7 +1322,7 @@ func callCephVolume(context *clusterd.Context, args ...string) (string, error) {
 	// failure log later without also printing out past failures
 	// TODO: does this mess up expectations from the ceph log collector daemon?
 	logPath := "/tmp/ceph-log"
-	if err := os.MkdirAll(logPath, 0700); err != nil {
+	if err := os.MkdirAll(logPath, 0o700); err != nil {
 		return "", errors.Wrapf(err, "failed to create dir %q", logPath)
 	}
 	baseArgs := []string{"-oL", cephVolumeCmd, "--log-path", logPath}
@@ -1181,4 +1362,26 @@ func isInOSDInfoList(uuid string, osds []oposd.OSDInfo) bool {
 	}
 
 	return false
+}
+
+func GetBackingDeviceForEncryptedBlock(context *clusterd.Context, disk string) (string, error) {
+	output, err := context.Executor.ExecuteCommandWithOutput(cryptsetupBinary, "status", disk, "-v")
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to run cryptsetup status on %s", disk)
+	}
+
+	// Example output line: "device:  /dev/sdb1"
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "device:") {
+			parts := strings.Fields(line)
+			logger.Infof("parts: %s", parts)
+			if len(parts) == 2 {
+				return parts[1], nil
+			}
+		}
+	}
+
+	return "", errors.Errorf("failed to find backing device for encrypted block %q", disk)
 }

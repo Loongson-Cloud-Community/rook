@@ -21,8 +21,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/hashicorp/vault/api"
-	"github.com/hashicorp/vault/vault"
+	"github.com/libopenstorage/secrets"
+	"github.com/libopenstorage/secrets/azure"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/operator/test"
@@ -55,8 +55,9 @@ func TestValidateConnectionDetails(t *testing.T) {
 			Name:      "kmip-token",
 			Namespace: ns,
 		},
-		Data: map[string][]byte{"CLIENT_CERT": []byte("bar"),
-			"CLIENT_KEY": []byte("bar"),
+		Data: map[string][]byte{
+			"CLIENT_CERT": []byte("bar"),
+			"CLIENT_KEY":  []byte("bar"),
 		},
 	}
 	tlsSecret := &v1.Secret{
@@ -75,6 +76,11 @@ func TestValidateConnectionDetails(t *testing.T) {
 			"KMS_PROVIDER": TypeKMIP,
 		},
 		TokenSecretName: "kmip-token",
+	}
+	azureKMSSpec := &cephv1.KeyManagementServiceSpec{
+		ConnectionDetails: map[string]string{
+			"KMS_PROVIDER": secrets.TypeAzure,
+		},
 	}
 
 	t.Run("no kms provider given", func(t *testing.T) {
@@ -166,44 +172,11 @@ func TestValidateConnectionDetails(t *testing.T) {
 		assert.NoError(t, err, "")
 	})
 
-	// test with vault server
-	t.Run("success - auto detect kv version and set it", func(t *testing.T) {
-		cluster := fakeVaultServer(t)
-		cluster.Start()
-		defer cluster.Cleanup()
-		core := cluster.Cores[0].Core
-		vault.TestWaitActive(t, core)
-		client := cluster.Cores[0].Client
-		// Mock the client here
-		vaultClient = func(ctx context.Context, clusterdContext *clusterd.Context, namespace string, secretConfig map[string]string) (*api.Client, error) {
-			return client, nil
-		}
-		if err := client.Sys().Mount("rook/", &api.MountInput{
-			Type:    "kv-v2",
-			Options: map[string]string{"version": "2"},
-		}); err != nil {
-			t.Fatal(err)
-		}
-		kms := &cephv1.KeyManagementServiceSpec{
-			ConnectionDetails: map[string]string{
-				"VAULT_SECRET_ENGINE": "kv",
-				"KMS_PROVIDER":        "vault",
-				"VAULT_ADDR":          client.Address(),
-				"VAULT_BACKEND_PATH":  "rook",
-			},
-			TokenSecretName: "vault-token",
-		}
-		err := ValidateConnectionDetails(ctx, clusterdContext, kms, ns)
-		assert.NoError(t, err, "")
-		assert.Equal(t, kms.ConnectionDetails["VAULT_BACKEND"], "v2")
-	})
-
 	t.Run("ibm kp - fail no token specified, only token is supported", func(t *testing.T) {
 		err := ValidateConnectionDetails(ctx, clusterdContext, ibmKMSSpec, ns)
 		assert.Error(t, err, "")
 		assert.EqualError(t, err, "failed to validate kms configuration (missing token in spec)")
 		ibmKMSSpec.TokenSecretName = "ibm-token"
-
 	})
 
 	t.Run("ibm kp - token present but no key for service key", func(t *testing.T) {
@@ -230,6 +203,39 @@ func TestValidateConnectionDetails(t *testing.T) {
 		// IBM_KP_SERVICE_API_KEY must be appended to the details so that the client can be built with
 		// all the details
 		assert.Equal(t, ibmKMSSpec.ConnectionDetails["IBM_KP_SERVICE_API_KEY"], "foo")
+	})
+
+	t.Run("azure kms - vault URL is missing ", func(t *testing.T) {
+		err := ValidateConnectionDetails(ctx, clusterdContext, azureKMSSpec, ns)
+		assert.Error(t, err, "")
+		assert.EqualError(t, err, "failed to validate kms config \"AZURE_VAULT_URL\". cannot be empty")
+	})
+
+	t.Run("azure kms - tenant ID is missing ", func(t *testing.T) {
+		azureKMSSpec.ConnectionDetails[azure.AzureVaultURL] = "test"
+		err := ValidateConnectionDetails(ctx, clusterdContext, azureKMSSpec, ns)
+		assert.Error(t, err, "")
+		assert.EqualError(t, err, "failed to validate kms config \"AZURE_TENANT_ID\". cannot be empty")
+	})
+
+	t.Run("azure kms - client ID is missing ", func(t *testing.T) {
+		azureKMSSpec.ConnectionDetails[azure.AzureTenantID] = "test"
+		err := ValidateConnectionDetails(ctx, clusterdContext, azureKMSSpec, ns)
+		assert.Error(t, err, "")
+		assert.EqualError(t, err, "failed to validate kms config \"AZURE_CLIENT_ID\". cannot be empty")
+	})
+
+	t.Run("azure kms - cert secret is missing ", func(t *testing.T) {
+		azureKMSSpec.ConnectionDetails[azure.AzureClientID] = "test"
+		err := ValidateConnectionDetails(ctx, clusterdContext, azureKMSSpec, ns)
+		assert.Error(t, err, "")
+		assert.EqualError(t, err, "failed to validate kms config \"AZURE_CERT_SECRET_NAME\". cannot be empty")
+	})
+
+	t.Run("azure kms - success", func(t *testing.T) {
+		azureKMSSpec.ConnectionDetails[azureClientCertSecretName] = "test"
+		err := ValidateConnectionDetails(ctx, clusterdContext, azureKMSSpec, ns)
+		assert.NoError(t, err)
 	})
 }
 

@@ -27,6 +27,7 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	opmon "github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
 	v1 "k8s.io/api/core/v1"
@@ -37,9 +38,7 @@ import (
 
 const (
 	// Default RADOS pool name after the NFS changes in Ceph
-	postNFSChangeDefaultPoolName = ".nfs"
-	// Default RADOS pool name before the NFS changes in Ceph
-	preNFSChangeDefaultPoolName = "nfs-ganesha"
+	nfsDefaultPoolName = ".nfs"
 
 	// CephNFSNameLabelKey is the label key that contains the name of the CephNFS resource
 	CephNFSNameLabelKey = "ceph_nfs"
@@ -56,8 +55,18 @@ type daemonConfig struct {
 
 // Create the ganesha server
 func (r *ReconcileCephNFS) upCephNFS(n *cephv1.CephNFS) error {
+	nfsToSkipReconcile, err := controller.GetDaemonsToSkipReconcile(r.clusterInfo.Context, r.context, n.Namespace, config.NfsType, AppName)
+	if err != nil {
+		return errors.Wrap(err, "failed to check for NFS daemons to skip reconcile")
+	}
+
 	for i := 0; i < n.Spec.Server.Active; i++ {
 		id := k8sutil.IndexToName(i)
+
+		if nfsToSkipReconcile.Has(fmt.Sprintf("%s-%s", n.Name, id)) {
+			logger.Warningf("skipping reconcile of nfs daemon %q with label %q", id, cephv1.SkipReconcileLabelKey)
+			continue
+		}
 
 		configName, configHash, err := r.createConfigMap(n, id)
 		if err != nil {
@@ -188,7 +197,6 @@ func (r *ReconcileCephNFS) runGaneshaRadosGrace(nfs *cephv1.CephNFS, name, actio
 }
 
 func (r *ReconcileCephNFS) generateConfigMap(n *cephv1.CephNFS, name string) *v1.ConfigMap {
-
 	data := map[string]string{
 		"config": getGaneshaConfig(n, r.clusterInfo.CephVersion, name),
 	}
@@ -277,6 +285,7 @@ func (r *ReconcileCephNFS) removeServersFromDatabase(n *cephv1.CephNFS, newActiv
 
 	return nil
 }
+
 func instanceName(n *cephv1.CephNFS, name string) string {
 	return fmt.Sprintf("%s-%s-%s", AppName, n.Name, name)
 }

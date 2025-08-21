@@ -19,9 +19,8 @@ package object
 
 import (
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -34,6 +33,8 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
+	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/pool"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
@@ -45,14 +46,15 @@ import (
 )
 
 type clusterConfig struct {
-	context     *clusterd.Context
-	clusterInfo *cephclient.ClusterInfo
-	store       *cephv1.CephObjectStore
-	rookVersion string
-	clusterSpec *cephv1.ClusterSpec
-	ownerInfo   *k8sutil.OwnerInfo
-	DataPathMap *config.DataPathMap
-	client      client.Client
+	context               *clusterd.Context
+	clusterInfo           *cephclient.ClusterInfo
+	store                 *cephv1.CephObjectStore
+	rookVersion           string
+	clusterSpec           *cephv1.ClusterSpec
+	ownerInfo             *k8sutil.OwnerInfo
+	DataPathMap           *config.DataPathMap
+	client                client.Client
+	shouldRotateCephxKeys bool
 }
 
 type rgwConfig struct {
@@ -61,18 +63,20 @@ type rgwConfig struct {
 	Realm        string
 	ZoneGroup    string
 	Zone         string
+
+	Auth           cephv1.AuthSpec
+	KeystoneSecret *v1.Secret
+	Protocols      cephv1.ProtocolSpec
 }
 
 var updateDeploymentAndWait = mon.UpdateCephDeploymentAndWait
 
-var (
-	insecureSkipVerify = "insecureSkipVerify"
-)
+var insecureSkipVerify = "insecureSkipVerify"
 
-func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName string) error {
+func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName string, keystoneSecret *v1.Secret) error {
 	logger.Infof("creating object store %q in namespace %q", c.store.Name, c.store.Namespace)
 
-	if err := c.startRGWPods(realmName, zoneGroupName, zoneName); err != nil {
+	if err := c.startRGWPods(realmName, zoneGroupName, zoneName, keystoneSecret); err != nil {
 		return errors.Wrap(err, "failed to start rgw pods")
 	}
 
@@ -82,20 +86,34 @@ func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName s
 		return nil
 	}
 
-	if err = enableRGWDashboard(objContext); err != nil {
-		logger.Warningf("failed to enable dashboard for rgw. %v", err)
+	if c.clusterSpec.Dashboard.Enabled {
+		if !c.store.Spec.IsRGWDashboardEnabled() {
+			disableRGWDashboard(objContext)
+		} else if err = enableRGWDashboard(objContext); err != nil {
+			logger.Warningf("failed to enable dashboard for rgw. %v", err)
+		}
 	}
 
 	logger.Infof("created object store %q in namespace %q", c.store.Name, c.store.Namespace)
 	return nil
 }
 
-func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) error {
+func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string, keystoneSecret *v1.Secret) error {
 	// backward compatibility, triggered during updates
 	if c.store.Spec.Gateway.Instances < 1 {
 		// Set the minimum of at least one instance
 		logger.Warning("spec.gateway.instances must be set to at least 1")
 		c.store.Spec.Gateway.Instances = 1
+	}
+
+	rgwsToSkipReconcile, err := controller.GetDaemonsToSkipReconcile(c.clusterInfo.Context, c.context, c.clusterInfo.Namespace, config.RgwType, AppName)
+	if err != nil {
+		return errors.Wrap(err, "failed to check for RGWs to skip reconcile")
+	}
+
+	if rgwsToSkipReconcile.Has(c.store.Name) {
+		logger.Warningf("skipping reconcile of rgw deployment %q with label %q", c.store.Name, cephv1.SkipReconcileLabelKey)
+		return nil
 	}
 
 	// start a new deployment and scale up
@@ -105,22 +123,26 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		var err error
 
 		daemonLetterID := k8sutil.IndexToName(i)
+
 		// Each rgw is id'ed by <store_name>-<letterID>
 		daemonName := fmt.Sprintf("%s-%s", c.store.Name, daemonLetterID)
 		// resource name is rook-ceph-rgw-<store_name>-<daemon_name>
 		resourceName := fmt.Sprintf("%s-%s-%s", AppName, c.store.Name, daemonLetterID)
 
 		rgwConfig := &rgwConfig{
-			ResourceName: resourceName,
-			DaemonID:     daemonName,
-			Realm:        realmName,
-			ZoneGroup:    zoneGroupName,
-			Zone:         zoneName,
+			ResourceName:   resourceName,
+			DaemonID:       daemonName,
+			Realm:          realmName,
+			ZoneGroup:      zoneGroupName,
+			Zone:           zoneName,
+			Auth:           c.store.Spec.Auth,
+			Protocols:      c.store.Spec.Protocols,
+			KeystoneSecret: keystoneSecret,
 		}
 
 		// We set the owner reference of the Secret to the Object controller instead of the replicaset
 		// because we watch for that resource and reconcile if anything happens to it
-		_, err = c.generateKeyring(rgwConfig)
+		secretResourceVersion, err := c.generateKeyring(rgwConfig)
 		if err != nil {
 			return errors.Wrap(err, "failed to create rgw keyring")
 		}
@@ -131,7 +153,7 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		// Unfortunately, on upgrade we would not set the flags which is not ideal for old clusters where we were no setting those flags
 		// The KV supports setting those flags even if the RGW is running
 		logger.Info("setting rgw config flags")
-		err = c.setDefaultFlagsMonConfigStore(rgwConfig)
+		err = c.setFlagsMonConfigStore(rgwConfig)
 		if err != nil {
 			// Getting EPERM typically happens when the flag may not be modified at runtime
 			// This is fine to ignore
@@ -159,6 +181,9 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		if err != nil {
 			return errors.Wrapf(err, "failed to set annotation for deployment %q", deployment.Name)
 		}
+
+		// apply cephx secret resource version to pod to ensure it restarts when keyring updates
+		deployment.Spec.Template.Annotations[keyring.CephxKeyIdentifierAnnotation] = secretResourceVersion
 
 		_, createErr := c.context.Clientset.AppsV1().Deployments(c.store.Namespace).Create(c.clusterInfo.Context, deployment, metav1.CreateOptions{})
 		if createErr != nil {
@@ -213,6 +238,7 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		if err != nil {
 			logger.Warningf("could not get deployments for object store %q (matching label selector %q). %v", c.store.Name, c.storeLabelSelector(), err)
 		}
+
 		currentRgwInstances = len(deps.Items)
 		if currentRgwInstances == desiredRgwInstances {
 			logger.Infof("successfully scaled down rgw deployments to %d in object store %q", desiredRgwInstances, c.store.Name)
@@ -314,32 +340,11 @@ func EmptyPool(pool cephv1.PoolSpec) bool {
 	return reflect.DeepEqual(pool, cephv1.PoolSpec{})
 }
 
-// GetDomainName build the dns name to reach out the service endpoint
-func GetDomainName(s *cephv1.CephObjectStore) string {
-	return getDomainName(s, true)
-}
-
 func GetStableDomainName(s *cephv1.CephObjectStore) string {
-	return getDomainName(s, false)
-}
-
-func getDomainName(s *cephv1.CephObjectStore, returnRandomDomainIfMultiple bool) string {
-	if s.Spec.IsExternal() {
-		// if the store is external, pick a random endpoint to use. if the endpoint is down, this
-		// reconcile may fail, but a future reconcile will eventually pick a different endpoint to try
-		endpoints := s.Spec.Gateway.ExternalRgwEndpoints
-		idx := 0
-		if returnRandomDomainIfMultiple {
-			idx = rand.Intn(len(endpoints)) //nolint:gosec // G404: cryptographically weak RNG is fine here
-		}
-		return endpoints[idx].String()
+	if !s.Spec.IsExternal() {
+		return s.GetServiceDomainName()
 	}
-
-	return domainNameOfService(s)
-}
-
-func domainNameOfService(s *cephv1.CephObjectStore) string {
-	return fmt.Sprintf("%s-%s.%s.%s", AppName, s.Name, s.Namespace, svcDNSSuffix)
+	return s.Spec.Gateway.ExternalRgwEndpoints[0].String()
 }
 
 func getAllDomainNames(s *cephv1.CephObjectStore) []string {
@@ -352,7 +357,9 @@ func getAllDomainNames(s *cephv1.CephObjectStore) []string {
 		return domains
 	}
 
-	return []string{domainNameOfService(s)}
+	// do not return hosting.dnsNames in this list because Rook has no way of knowing for sure how
+	// they can be used. some might be TLS-only or non-TLS, or inaccessible from k8s
+	return []string{s.GetServiceDomainName()}
 }
 
 func getAllDNSEndpoints(s *cephv1.CephObjectStore, port int32, secure bool) []string {
@@ -402,17 +409,18 @@ func GetTlsCaCert(objContext *Context, objectStoreSpec *cephv1.ObjectStoreSpec) 
 		if err != nil {
 			return nil, false, errors.Wrapf(err, "failed to get secret %q containing TLS certificate defined in %q", objectStoreSpec.Gateway.SSLCertificateRef, objContext.Name)
 		}
-		if tlsSecretCert.Type == v1.SecretTypeOpaque {
+		switch tlsSecretCert.Type {
+		case v1.SecretTypeOpaque:
 			tlsCert, ok = tlsSecretCert.Data[certKeyName]
 			if !ok {
 				return nil, false, errors.Errorf("failed to get TLS certificate from secret, token is %q but key %q does not exist", v1.SecretTypeOpaque, certKeyName)
 			}
-		} else if tlsSecretCert.Type == v1.SecretTypeTLS {
+		case v1.SecretTypeTLS:
 			tlsCert, ok = tlsSecretCert.Data[v1.TLSCertKey]
 			if !ok {
 				return nil, false, errors.Errorf("failed to get TLS certificate from secret, token is %q but key %q does not exist", v1.SecretTypeTLS, v1.TLSCertKey)
 			}
-		} else {
+		default:
 			return nil, false, errors.Errorf("failed to get TLS certificate from secret, unknown secret type %q", tlsSecretCert.Type)
 		}
 		// If the secret contains an indication that the TLS connection should be insecure, then
@@ -425,7 +433,7 @@ func GetTlsCaCert(objContext *Context, objectStoreSpec *cephv1.ObjectStoreSpec) 
 			}
 		}
 	} else if objectStoreSpec.GetServiceServingCert() != "" {
-		tlsCert, err = ioutil.ReadFile(ServiceServingCertCAFile)
+		tlsCert, err = os.ReadFile(ServiceServingCertCAFile)
 		if err != nil {
 			return nil, false, errors.Wrapf(err, "failed to fetch TLS certificate from %q", ServiceServingCertCAFile)
 		}

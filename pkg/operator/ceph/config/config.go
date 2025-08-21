@@ -29,7 +29,6 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
-	"github.com/rook/rook/pkg/operator/ceph/version"
 )
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-config")
@@ -49,6 +48,9 @@ const (
 
 	// RgwType defines the rgw DaemonType
 	RgwType = "rgw"
+
+	// NfsType defines the nfs DaemonType
+	NfsType = "nfs"
 
 	// RbdMirrorType defines the rbd-mirror DaemonType
 	RbdMirrorType = "rbd-mirror"
@@ -90,7 +92,7 @@ var (
 // when they are specified as "some config key" in one section, "some_config_key" in another
 // section, and "some-config-key" in yet another section.
 func normalizeKey(key string) string {
-	return strings.Replace(strings.Replace(key, " ", "_", -1), "-", "_", -1)
+	return strings.ReplaceAll(strings.ReplaceAll(key, " ", "_"), "-", "_")
 }
 
 // NewFlag returns the key-value pair in the format of a Ceph command line-compatible flag.
@@ -98,7 +100,7 @@ func NewFlag(key, value string) string {
 	// A flag is a normalized key with underscores replaced by dashes.
 	// "debug default" ~normalize~> "debug_default" ~to~flag~> "debug-default"
 	n := normalizeKey(key)
-	f := strings.Replace(n, "_", "-", -1)
+	f := strings.ReplaceAll(n, "_", "-")
 	return fmt.Sprintf("--%s=%s", f, value)
 }
 
@@ -137,20 +139,6 @@ func SetOrRemoveDefaultConfigs(
 		}
 	}
 
-	// Apply Multus if needed
-	if clusterSpec.Network.IsMultus() {
-		logger.Info("configuring ceph network(s) with multus")
-		cephNetworks, err := generateNetworkSettings(clusterInfo.Context, context, clusterInfo.Namespace, clusterSpec.Network.Selectors)
-		if err != nil {
-			return errors.Wrap(err, "failed to generate network settings")
-		}
-
-		// Apply ceph network settings to the mon config store
-		if err := monStore.SetAll("global", cephNetworks); err != nil {
-			return errors.Wrap(err, "failed to network config overrides")
-		}
-	}
-
 	// This section will remove any previously configured option(s) from the mon centralized store
 	// This is useful for scenarios where options are not needed anymore and we just want to reset to internal's default
 	// On upgrade, the flag will be removed
@@ -162,26 +150,10 @@ func SetOrRemoveDefaultConfigs(
 }
 
 func DisableInsecureGlobalID(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo) {
-	if !canDisableInsecureGlobalID(clusterInfo) {
-		logger.Infof("cannot disable insecure global id on ceph version %v", clusterInfo.CephVersion.String())
-		return
-	}
-
 	monStore := GetMonStore(context, clusterInfo)
 	if err := monStore.Set("mon", "auth_allow_insecure_global_id_reclaim", "false"); err != nil {
 		logger.Warningf("failed to disable the insecure global ID. %v", err)
 	} else {
 		logger.Info("insecure global ID is now disabled")
 	}
-}
-
-func canDisableInsecureGlobalID(clusterInfo *cephclient.ClusterInfo) bool {
-	cephver := clusterInfo.CephVersion
-	if cephver.IsAtLeastQuincy() {
-		return true
-	}
-	if cephver.IsPacific() && cephver.IsAtLeast(version.CephVersion{Major: 16, Minor: 2, Extra: 1}) {
-		return true
-	}
-	return false
 }

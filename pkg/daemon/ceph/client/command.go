@@ -81,8 +81,10 @@ func FinalizeCephCommandArgs(command string, clusterInfo *ClusterInfo, args []st
 
 	// If the command should be run inside the toolbox pod, include the kubectl args to call the toolbox
 	if RunAllCephCommandsInToolboxPod != "" {
-		toolArgs := []string{"exec", "-i", RunAllCephCommandsInToolboxPod, "-n", clusterInfo.Namespace,
-			"--", "timeout", timeout, command}
+		toolArgs := []string{
+			"exec", "-i", RunAllCephCommandsInToolboxPod, "-n", clusterInfo.Namespace,
+			"--", "timeout", timeout, command,
+		}
 		return Kubectl, append(toolArgs, args...)
 	}
 
@@ -207,12 +209,13 @@ func (c *CephToolCommand) run() ([]byte, error) {
 	// Still forcing the check for the command if the behavior changes in the future
 	if command == RBDTool || command == RadosTool || command == GaneshaRadosGraceTool {
 		if c.RemoteExecution {
-			output, stderr, err = c.context.RemoteExecutor.ExecCommandInContainerWithFullOutputWithTimeout(c.clusterInfo.Context, ProxyAppLabel, CommandProxyInitContainerName, c.clusterInfo.Namespace, append([]string{command}, args...)...)
+			defaultTimeout := exec.CephCommandsTimeout
+			output, stderr, err = c.context.RemoteExecutor.ExecCommandInContainerWithFullOutputWithTimeout(c.clusterInfo.Context, ProxyAppLabel, CommandProxyInitContainerName, c.clusterInfo.Namespace, defaultTimeout, append([]string{command}, args...)...)
 			if err != nil {
 				err = errors.Errorf("%s", err.Error())
 			}
 			if stderr != "" {
-				err = errors.Errorf("%s", stderr)
+				err = errors.Errorf("err=%s: stderr=%s", err.Error(), stderr)
 			}
 		} else if c.timeout == 0 {
 			output, err = c.context.Executor.ExecuteCommandWithOutput(command, args...)
@@ -253,23 +256,15 @@ func ExecuteRBDCommandWithTimeout(context *clusterd.Context, args []string) (str
 
 func ExecuteCephCommandWithRetry(
 	cmd func() (string, []byte, error),
-	getExitCode func(err error) (int, bool),
 	retries int,
-	retryOnExitCode int,
 	waitTime time.Duration,
 ) ([]byte, error) {
 	for i := 0; i < retries; i++ {
 		action, data, err := cmd()
 		if err != nil {
-			exitCode, parsed := getExitCode(err)
-			if parsed {
-				if exitCode == retryOnExitCode {
-					logger.Infof("command failed for %s. trying again...", action)
-					time.Sleep(waitTime)
-					continue
-				}
-			}
-			return nil, errors.Wrapf(err, "failed to complete command for %s", action)
+			logger.Infof("command failed for %s. trying again...", action)
+			time.Sleep(waitTime)
+			continue
 		}
 		if i > 0 {
 			logger.Infof("action %s succeeded on attempt %d", action, i)

@@ -39,10 +39,12 @@ func (r *ReconcileCephRBDMirror) makeDeployment(daemonConfig *daemonConfig, rbdM
 			Containers: []v1.Container{
 				r.makeMirroringDaemonContainer(daemonConfig, rbdMirror),
 			},
-			RestartPolicy:     v1.RestartPolicyAlways,
-			Volumes:           controller.DaemonVolumes(daemonConfig.DataPathMap, daemonConfig.ResourceName),
-			HostNetwork:       r.cephClusterSpec.Network.IsHost(),
-			PriorityClassName: rbdMirror.Spec.PriorityClassName,
+			RestartPolicy:      v1.RestartPolicyAlways,
+			Volumes:            controller.DaemonVolumes(daemonConfig.DataPathMap, daemonConfig.ResourceName, r.cephClusterSpec.DataDirHostPath),
+			HostNetwork:        r.cephClusterSpec.Network.IsHost(),
+			PriorityClassName:  rbdMirror.Spec.PriorityClassName,
+			SecurityContext:    &v1.PodSecurityContext{},
+			ServiceAccountName: k8sutil.DefaultServiceAccount,
 		},
 	}
 
@@ -55,7 +57,7 @@ func (r *ReconcileCephRBDMirror) makeDeployment(daemonConfig *daemonConfig, rbdM
 		// ceph-client.rbd-mirror.a.log
 		// <CLUSTER_FSID>-client.rbd-mirror-peer.log
 		logRotationFilter := "*-client.rbd-mirror*"
-		podSpec.Spec.Containers = append(podSpec.Spec.Containers, *controller.LogCollectorContainer(logRotationFilter, r.clusterInfo.Namespace, *r.cephClusterSpec))
+		podSpec.Spec.Containers = append(podSpec.Spec.Containers, *controller.LogCollectorContainer(logRotationFilter, r.clusterInfo.Namespace, *r.cephClusterSpec, nil))
 	}
 
 	// Replace default unreachable node toleration
@@ -66,12 +68,13 @@ func (r *ReconcileCephRBDMirror) makeDeployment(daemonConfig *daemonConfig, rbdM
 	if r.cephClusterSpec.Network.IsHost() {
 		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	} else if r.cephClusterSpec.Network.IsMultus() {
-		if err := k8sutil.ApplyMultus(r.cephClusterSpec.Network, &podSpec.ObjectMeta); err != nil {
+		if err := k8sutil.ApplyMultus(r.clusterInfo.Namespace, &r.cephClusterSpec.Network, &podSpec.ObjectMeta); err != nil {
 			return nil, err
 		}
 	}
 	rbdMirror.Spec.Placement.ApplyToPodSpec(&podSpec.Spec)
 
+	// nolint:gosec // G115 no overflow expected for rbd mirror count
 	replicas := int32(rbdMirror.Spec.Count)
 	d := &apps.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -81,6 +84,7 @@ func (r *ReconcileCephRBDMirror) makeDeployment(daemonConfig *daemonConfig, rbdM
 			Labels:      controller.CephDaemonAppLabels(AppName, rbdMirror.Namespace, config.RbdMirrorType, daemonConfig.DaemonID, rbdMirror.Name, "cephrbdmirrors.ceph.rook.io", true),
 		},
 		Spec: apps.DeploymentSpec{
+			RevisionHistoryLimit: controller.RevisionHistoryLimit(),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: podSpec.Labels,
 			},
@@ -101,9 +105,10 @@ func (r *ReconcileCephRBDMirror) makeChownInitContainer(daemonConfig *daemonConf
 		*daemonConfig.DataPathMap,
 		r.cephClusterSpec.CephVersion.Image,
 		controller.GetContainerImagePullPolicy(r.cephClusterSpec.CephVersion.ImagePullPolicy),
-		controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName),
+		controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName, r.cephClusterSpec.DataDirHostPath),
 		rbdMirror.Spec.Resources,
-		controller.PodSecurityContext(),
+		controller.DefaultContainerSecurityContext(),
+		"",
 	)
 }
 
@@ -120,10 +125,10 @@ func (r *ReconcileCephRBDMirror) makeMirroringDaemonContainer(daemonConfig *daem
 		),
 		Image:           r.cephClusterSpec.CephVersion.Image,
 		ImagePullPolicy: controller.GetContainerImagePullPolicy(r.cephClusterSpec.CephVersion.ImagePullPolicy),
-		VolumeMounts:    controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName),
-		Env:             controller.DaemonEnvVars(r.cephClusterSpec.CephVersion.Image),
+		VolumeMounts:    controller.DaemonVolumeMounts(daemonConfig.DataPathMap, daemonConfig.ResourceName, r.cephClusterSpec.DataDirHostPath),
+		Env:             controller.DaemonEnvVars(r.cephClusterSpec),
 		Resources:       rbdMirror.Spec.Resources,
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: controller.DefaultContainerSecurityContext(),
 		WorkingDir:      config.VarLogCephDir,
 		// TODO:
 		// Not implemented at this point since the socket name is '/run/ceph/ceph-client.rbd-mirror.a.1.94362516231272.asok'

@@ -17,7 +17,6 @@ limitations under the License.
 package test
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -75,7 +74,6 @@ func (e *MockExecutor) ExecuteCommandWithOutput(command string, arg ...string) (
 
 // ExecuteCommandWithTimeout mocks ExecuteCommandWithTimeout
 func (e *MockExecutor) ExecuteCommandWithTimeout(timeout time.Duration, command string, arg ...string) (string, error) {
-
 	if e.MockExecuteCommandWithTimeout != nil {
 		return e.MockExecuteCommandWithTimeout(time.Second, command, arg...)
 	}
@@ -139,5 +137,5 @@ func TestMockExecHelperProcess(t *testing.T) {
 }
 
 func FakeTimeoutError(text string) error {
-	return errors.New(fmt.Sprintf("exec timeout waiting for %s", text))
+	return fmt.Errorf("exec timeout waiting for %s", text)
 }

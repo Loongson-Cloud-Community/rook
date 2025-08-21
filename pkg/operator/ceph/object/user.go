@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ceph/go-ceph/rgw/admin"
 	"github.com/pkg/errors"
@@ -106,6 +107,13 @@ func GetUser(c *Context, id string) (*ObjectUser, int, error) {
 // Subsequent interaction with the API will be done with the created user
 func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
 	logger.Debugf("creating s3 user %q", user.UserID)
+	timeout := exec.CephCommandsTimeout
+	if user.UserID == RGWAdminOpsUserSecretName {
+		// Setting a really long timeout for the command that creates the admin user
+		// This is a workaround until we find what is the root cause that the creation
+		// is commonly taking about two minutes, instead of sub-second as in previous releases.
+		timeout = 10 * time.Minute
+	}
 
 	if strings.TrimSpace(user.UserID) == "" {
 		return nil, RGWErrorBadData, errors.New("userId cannot be empty")
@@ -146,7 +154,7 @@ func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, erro
 		args = append(args, "--yes-i-really-mean-it")
 	}
 
-	result, err := runAdminCommand(c, true, args...)
+	result, err := runAdminCommandWithTimeout(c, true, timeout, args...)
 	if err != nil {
 		if code, err := exec.ExtractExitCode(err); err == nil && code == int(syscall.EEXIST) {
 			return nil, ErrorCodeFileExists, errors.New("s3 user already exists")
@@ -178,9 +186,10 @@ func CreateOrRecreateUserIfExists(c *Context, user ObjectUser, force bool) (*Obj
 		return nil, errCode, err
 	}
 
-	if errCode == RGWErrorNone {
+	switch errCode {
+	case RGWErrorNone:
 		return objUser, errCode, err
-	} else if errCode == ErrorCodeFileExists {
+	case ErrorCodeFileExists:
 		// If the user already exists, delete and re-create it
 		_, err := DeleteUser(c, user.UserID)
 		if err != nil {
@@ -192,7 +201,6 @@ func CreateOrRecreateUserIfExists(c *Context, user ObjectUser, force bool) (*Obj
 }
 
 func ListUserBuckets(c *Context, id string, opts ...string) (string, error) {
-
 	args := []string{"bucket", "list", "--uid", id}
 	if opts != nil {
 		args = append(args, opts...)

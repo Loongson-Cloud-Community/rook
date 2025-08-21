@@ -29,21 +29,22 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestGeneratePassword(t *testing.T) {
-	password, err := GeneratePassword(0)
+	password, err := GeneratePassword(0, DefaultKey)
 	require.Nil(t, err)
 	assert.Equal(t, "", password)
 
-	password, err = GeneratePassword(1)
+	password, err = GeneratePassword(1, DefaultKey)
 	require.Nil(t, err)
 	assert.Equal(t, 1, len(password))
 	logger.Infof("password: %s", password)
 
-	password, err = GeneratePassword(10)
+	password, err = GeneratePassword(10, DefaultKey)
 	require.Nil(t, err)
 	assert.Equal(t, 10, len(password))
 	logger.Infof("password: %s", password)
@@ -87,9 +88,10 @@ func TestStartSecureDashboard(t *testing.T) {
 		logger.Infof("command: %s %v", command, args)
 		exitCodeResponse = 0
 		if args[1] == "module" {
-			if args[2] == "enable" {
+			switch args[2] {
+			case "enable":
 				enables++
-			} else if args[2] == "disable" {
+			case "disable":
 				disables++
 			}
 		}
@@ -113,11 +115,12 @@ func TestStartSecureDashboard(t *testing.T) {
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "myns",
-		CephVersion: cephver.Quincy,
+		CephVersion: cephver.Squid,
 		OwnerInfo:   ownerInfo,
 		Context:     ctx,
 	}
-	c := &Cluster{clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
+	c := &Cluster{
+		clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
 		spec: cephv1.ClusterSpec{
 			Dashboard:   cephv1.DashboardSpec{Port: 443, Enabled: true, SSL: true},
 			CephVersion: cephv1.CephVersionSpec{Image: "quay.io/ceph/ceph:v15"},
@@ -131,7 +134,7 @@ func TestStartSecureDashboard(t *testing.T) {
 	}
 
 	dashboardInitWaitTime = 0
-	err := c.configureDashboardService("a")
+	err := c.configureDashboardService()
 	assert.NoError(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -148,7 +151,7 @@ func TestStartSecureDashboard(t *testing.T) {
 
 	// disable the dashboard
 	c.spec.Dashboard.Enabled = false
-	err = c.configureDashboardService("a")
+	err = c.configureDashboardService()
 	assert.Nil(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -158,12 +161,12 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.NotNil(t, err)
 	assert.True(t, kerrors.IsNotFound(err))
-	assert.Nil(t, svc)
+	assert.Equal(t, svc, &v1.Service{})
 
 	// Set the port to something over 1024 and confirm the port and targetPort are the same
 	c.spec.Dashboard.Enabled = true
 	c.spec.Dashboard.Port = 1025
-	err = c.configureDashboardService("a")
+	err = c.configureDashboardService()
 	assert.Nil(t, err)
 
 	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
@@ -175,7 +178,7 @@ func TestStartSecureDashboard(t *testing.T) {
 	// Fall back to the default port
 	c.spec.Dashboard.Enabled = true
 	c.spec.Dashboard.Port = 0
-	err = c.configureDashboardService("a")
+	err = c.configureDashboardService()
 	assert.Nil(t, err)
 
 	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})

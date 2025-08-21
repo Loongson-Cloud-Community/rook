@@ -18,6 +18,7 @@ package object
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
@@ -31,12 +32,15 @@ import (
 )
 
 func (r *ReconcileCephObjectStore) setFailedStatus(observedGeneration int64, name types.NamespacedName, errMessage string, err error) (reconcile.Result, error) {
-	updateStatus(r.opManagerContext, observedGeneration, r.client, name, cephv1.ConditionFailure, map[string]string{})
+	statusErr := updateStatus(r.opManagerContext, observedGeneration, r.client, name, cephv1.ConditionFailure, map[string]string{}, nil)
+	if statusErr != nil {
+		return reconcile.Result{}, errors.Wrapf(statusErr, "failed to set failed status for object store %q", name)
+	}
 	return reconcile.Result{}, errors.Wrapf(err, "%s", errMessage)
 }
 
 // updateStatus updates an object with a given status
-func updateStatus(ctx context.Context, observedGeneration int64, client client.Client, namespacedName types.NamespacedName, status cephv1.ConditionType, info map[string]string) {
+func updateStatus(ctx context.Context, observedGeneration int64, client client.Client, namespacedName types.NamespacedName, status cephv1.ConditionType, info map[string]string, cephx *cephv1.CephxStatus) error {
 	// Updating the status is important to users, but we can still keep operating if there is a
 	// failure. Retry a few times to give it our best effort attempt.
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -77,28 +81,46 @@ func updateStatus(ctx context.Context, observedGeneration int64, client client.C
 			objectStore.Status.Endpoints.Secure = getAllDNSEndpoints(objectStore, securePort, true)
 		}
 
+		if cephx != nil {
+			objectStore.Status.Cephx.Daemon = *cephx
+		}
+
 		if err := reporting.UpdateStatus(client, objectStore); err != nil {
 			return errors.Wrapf(err, "failed to set object store %q status to %q", namespacedName.String(), status)
 		}
 		return nil
 	})
 	if err != nil {
-		logger.Error(err)
+		return err
 	}
 
 	logger.Debugf("object store %q status updated to %q", namespacedName.String(), status)
+	return nil
 }
 
 func buildStatusInfo(cephObjectStore *cephv1.CephObjectStore) map[string]string {
+	nsName := fmt.Sprintf("%s/%s", cephObjectStore.Namespace, cephObjectStore.Name)
+
 	m := make(map[string]string)
 
-	if cephObjectStore.Spec.Gateway.SecurePort != 0 && cephObjectStore.Spec.Gateway.Port != 0 {
-		m["secureEndpoint"] = BuildDNSEndpoint(GetStableDomainName(cephObjectStore), cephObjectStore.Spec.Gateway.SecurePort, true)
+	advertiseEndpoint, err := cephObjectStore.GetAdvertiseEndpointUrl()
+	if err != nil {
+		// lots of validation happens before this point, so this should be nearly impossible
+		logger.Errorf("failed to get advertise endpoint for CephObjectStore %q to record on status; continuing without this. %v", nsName, err)
+	}
+
+	if cephObjectStore.AdvertiseEndpointIsSet() {
+		// if the advertise endpoint is explicitly set, it takes precedence as the only endpoint
+		m["endpoint"] = advertiseEndpoint
+		return m
+	}
+
+	if cephObjectStore.Spec.Gateway.Port != 0 && cephObjectStore.Spec.Gateway.SecurePort != 0 {
+		// by definition, advertiseEndpoint should prefer HTTPS, so the inverse arrangement doesn't apply
+		m["secureEndpoint"] = advertiseEndpoint
 		m["endpoint"] = BuildDNSEndpoint(GetStableDomainName(cephObjectStore), cephObjectStore.Spec.Gateway.Port, false)
-	} else if cephObjectStore.Spec.Gateway.SecurePort != 0 {
-		m["endpoint"] = BuildDNSEndpoint(GetStableDomainName(cephObjectStore), cephObjectStore.Spec.Gateway.SecurePort, true)
 	} else {
-		m["endpoint"] = BuildDNSEndpoint(GetStableDomainName(cephObjectStore), cephObjectStore.Spec.Gateway.Port, false)
+		m["endpoint"] = advertiseEndpoint
 	}
 
 	return m

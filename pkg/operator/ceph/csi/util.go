@@ -18,6 +18,7 @@ package csi
 
 import (
 	"bytes"
+	"fmt"
 	"strconv"
 	"strings"
 	"text/template"
@@ -83,25 +84,38 @@ func templateToDeployment(name, templateData string, p templateParam) (*apps.Dep
 	return &dep, nil
 }
 
-func applyResourcesToContainers(opConfig map[string]string, key string, podspec *corev1.PodSpec) {
-	resource := getComputeResource(opConfig, key)
-	if len(resource) > 0 {
+func applyLogrotateSidecar(specTemplate *corev1.PodTemplateSpec, name, templateData string, p templateParam) {
+	var logrotateSidecarContainer corev1.Container
+	t, err := loadTemplate(name, templateData, p)
+	if err != nil {
+		panic(errors.Wrap(err, "failed to load logrotate container template"))
+	}
+
+	err = yaml.Unmarshal(t, &logrotateSidecarContainer)
+	if err != nil {
+		panic(errors.Wrap(err, "failed to unmarshal logrotate container template"))
+	}
+	specTemplate.Spec.Containers = append(specTemplate.Spec.Containers, logrotateSidecarContainer)
+}
+
+func applyResourcesToContainers(key string, podspec *corev1.PodSpec) {
+	resource := getComputeResource(key)
+
+	for _, r := range resource {
 		for i, c := range podspec.Containers {
-			for _, r := range resource {
-				if c.Name == r.Name {
-					podspec.Containers[i].Resources = r.Resource
-				}
+			if c.Name == r.Name {
+				podspec.Containers[i].Resources = r.Resource
 			}
 		}
 	}
 }
 
-func getComputeResource(opConfig map[string]string, key string) []k8sutil.ContainerResource {
+func getComputeResource(key string) []k8sutil.ContainerResource {
 	// Add Resource list if any
 	resource := []k8sutil.ContainerResource{}
 	var err error
 
-	if resourceRaw := k8sutil.GetValue(opConfig, key, ""); resourceRaw != "" {
+	if resourceRaw := k8sutil.GetOperatorSetting(key, ""); resourceRaw != "" {
 		resource, err = k8sutil.YamlToContainerResourceArray(resourceRaw)
 		if err != nil {
 			logger.Warningf("failed to parse %q. %v", resourceRaw, err)
@@ -110,9 +124,9 @@ func getComputeResource(opConfig map[string]string, key string) []k8sutil.Contai
 	return resource
 }
 
-func getToleration(opConfig map[string]string, tolerationsName string, defaultTolerations []corev1.Toleration) []corev1.Toleration {
+func getToleration(tolerationsName string, defaultTolerations []corev1.Toleration) []corev1.Toleration {
 	// Add toleration if any, otherwise return defaultTolerations
-	tolerationsRaw := k8sutil.GetValue(opConfig, tolerationsName, "")
+	tolerationsRaw := k8sutil.GetOperatorSetting(tolerationsName, "")
 	if tolerationsRaw == "" {
 		return defaultTolerations
 	}
@@ -133,9 +147,9 @@ func getToleration(opConfig map[string]string, tolerationsName string, defaultTo
 	return tolerations
 }
 
-func getNodeAffinity(opConfig map[string]string, nodeAffinityName string, defaultNodeAffinity *corev1.NodeAffinity) *corev1.NodeAffinity {
+func getNodeAffinity(nodeAffinityName string, defaultNodeAffinity *corev1.NodeAffinity) *corev1.NodeAffinity {
 	// Add NodeAffinity if any, otherwise return defaultNodeAffinity
-	nodeAffinity := k8sutil.GetValue(opConfig, nodeAffinityName, "")
+	nodeAffinity := k8sutil.GetOperatorSetting(nodeAffinityName, "")
 	if nodeAffinity == "" {
 		return defaultNodeAffinity
 	}
@@ -154,9 +168,9 @@ func applyToPodSpec(pod *corev1.PodSpec, n *corev1.NodeAffinity, t []corev1.Tole
 	}
 }
 
-func getPortFromConfig(data map[string]string, env string, defaultPort uint16) (uint16, error) {
-	port := k8sutil.GetValue(data, env, strconv.Itoa(int(defaultPort)))
-	if strings.TrimSpace(k8sutil.GetValue(data, env, strconv.Itoa(int(defaultPort)))) == "" {
+func getPortFromConfig(env string, defaultPort uint16) (uint16, error) {
+	port := k8sutil.GetOperatorSetting(env, strconv.Itoa(int(defaultPort)))
+	if strings.TrimSpace(k8sutil.GetOperatorSetting(env, strconv.Itoa(int(defaultPort)))) == "" {
 		return defaultPort, nil
 	}
 	p, err := strconv.ParseUint(port, 10, 64)
@@ -183,14 +197,14 @@ func GetPodAntiAffinity(key, value string) corev1.PodAntiAffinity {
 						},
 					},
 				},
-				TopologyKey: corev1.LabelHostname,
+				TopologyKey: k8sutil.LabelHostname(),
 			},
 		},
 	}
 }
 
-func applyVolumeToPodSpec(opConfig map[string]string, configName string, podspec *corev1.PodSpec) {
-	volumesRaw := k8sutil.GetValue(opConfig, configName, "")
+func applyVolumeToPodSpec(configName string, podspec *corev1.PodSpec) {
+	volumesRaw := k8sutil.GetOperatorSetting(configName, "")
 	if volumesRaw == "" {
 		return
 	}
@@ -199,27 +213,25 @@ func applyVolumeToPodSpec(opConfig map[string]string, configName string, podspec
 		logger.Warningf("failed to parse %q for %q. %v", volumesRaw, configName, err)
 		return
 	}
-	if len(volumes) > 0 {
-		for i := range volumes {
-			found := false
-			for j := range podspec.Volumes {
-				// check do we need to override any existing volumes
-				if volumes[i].Name == podspec.Volumes[j].Name {
-					podspec.Volumes[j] = volumes[i]
-					found = true
-					break
-				}
+	for i := range volumes {
+		found := false
+		for j := range podspec.Volumes {
+			// check do we need to override any existing volumes
+			if volumes[i].Name == podspec.Volumes[j].Name {
+				podspec.Volumes[j] = volumes[i]
+				found = true
+				break
 			}
-			if !found {
-				// if not found add volume to volumes list
-				podspec.Volumes = append(podspec.Volumes, volumes[i])
-			}
+		}
+		if !found {
+			// if not found add volume to volumes list
+			podspec.Volumes = append(podspec.Volumes, volumes[i])
 		}
 	}
 }
 
-func applyVolumeMountToContainer(opConfig map[string]string, configName, containerName string, podspec *corev1.PodSpec) {
-	volumeMountsRaw := k8sutil.GetValue(opConfig, configName, "")
+func applyVolumeMountToContainer(configName, containerName string, podspec *corev1.PodSpec) {
+	volumeMountsRaw := k8sutil.GetOperatorSetting(configName, "")
 	if volumeMountsRaw == "" {
 		return
 	}
@@ -251,4 +263,16 @@ func applyVolumeMountToContainer(opConfig map[string]string, configName, contain
 			}
 		}
 	}
+}
+
+// getImage returns the image for the given setting name. If the image does not contain version,
+// the default version is appended from the default image.
+func getImage(settingName, defaultImage string) string {
+	image := k8sutil.GetOperatorSetting(settingName, defaultImage)
+	if !strings.Contains(image, ":") {
+		version := strings.SplitN(defaultImage, ":", 2)[1]
+		image = fmt.Sprintf("%s:%s", image, version)
+	}
+
+	return image
 }

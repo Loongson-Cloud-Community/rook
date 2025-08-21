@@ -131,7 +131,7 @@ func OkToStop(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, d
 			// if we have less than 3 mons we skip the check and do best-effort
 			// we do less than 3 because during the initial bootstrap the mon sequence is updated too
 			// so running the check on 2/3 mon fails
-			// versions.Mon looks like this map[ceph version 17.0.0-12-g6c8fb92 (6c8fb920cb1d862f36ee852ed849a15f9a50bd68) quincy (dev):1]
+			// versions.Mon looks like this map[ceph version 19.0.0-12-g6c8fb92 (6c8fb920cb1d862f36ee852ed849a15f9a50bd68) squid (dev):1]
 			// now looping over a single element since we can't address the key directly (we don't know its name)
 			for _, monCount := range versions.Mon {
 				if monCount < 3 {
@@ -180,7 +180,7 @@ func okToStopDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, deploym
 		args := []string{daemonType, "ok-to-stop", daemonName}
 		buf, err := NewCephCommand(context, clusterInfo, args).Run()
 		if err != nil {
-			return errors.Wrapf(err, "deployment %s cannot be stopped", deployment)
+			return errors.Wrapf(err, "deployment %s cannot be stopped. %s", deployment, string(buf))
 		}
 		output := string(buf)
 		logger.Debugf("deployment %s is ok to be updated. %s", deployment, output)
@@ -214,12 +214,12 @@ func okToContinueMDSDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, 
 // Assume the following:
 //
 //	"mon": {
-//	    "ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 2,
-//	    "ceph version 17.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) quincy (stable)": 1
+//	    "ceph version 18.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) reef (stable)": 2,
+//	    "ceph version 19.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) squid (stable)": 1
 //	}
 //
-// In the case we will pick: "ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 2,
-// And eventually return 16.2.5
+// In the case we will pick: "ceph version 18.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) reef (stable)": 2,
+// And eventually return 18.2.5
 func LeastUptodateDaemonVersion(context *clusterd.Context, clusterInfo *ClusterInfo, daemonType string) (cephver.CephVersion, error) {
 	var r map[string]int
 	var vv cephver.CephVersion
@@ -234,15 +234,23 @@ func LeastUptodateDaemonVersion(context *clusterd.Context, clusterInfo *ClusterI
 	if err != nil {
 		return vv, errors.Wrap(err, "failed to find daemon map entry")
 	}
+
+	maxInt := 65535
+
+	vv = cephver.CephVersion{Major: maxInt, Minor: maxInt, Extra: maxInt, Build: maxInt, CommitID: ""}
 	for v := range r {
 		version, err := cephver.ExtractCephVersion(v)
 		if err != nil {
-			return vv, errors.Wrap(err, "failed to extract ceph version")
+			return cephver.CephVersion{}, errors.Wrap(err, "failed to extract ceph version")
 		}
-		vv = *version
-		// break right after the first iteration
-		// the first one is always the least up-to-date
-		break
+
+		if cephver.IsInferior(*version, vv) {
+			vv = *version
+		}
+	}
+
+	if vv.Major == maxInt {
+		return cephver.CephVersion{}, errors.Wrap(err, "failed to determine least ceph version")
 	}
 
 	return vv, nil
@@ -341,21 +349,6 @@ func OSDUpdateShouldCheckOkToStop(context *clusterd.Context, clusterInfo *Cluste
 	}
 	if len(osds) < 3 {
 		logger.Warningf("the cluster has fewer than 3 osds. not performing upgrade check. running in best-effort")
-		return false
-	}
-
-	// aio means all in one
-	aio, err := allOSDsSameHost(context, clusterInfo)
-	if err != nil {
-		if errors.Is(err, errNoHostInCRUSH) {
-			logger.Warning("the CRUSH map has no 'host' entries so not performing ok-to-stop checks")
-			return false
-		}
-		logger.Warningf("failed to determine if all osds are running on the same host. will check if OSDs are ok-to-stop. if all OSDs are running on one host %s. %v", userIntervention, err)
-		return true
-	}
-	if aio {
-		logger.Warningf("all OSDs are running on the same host. not performing upgrade check. running in best-effort")
 		return false
 	}
 

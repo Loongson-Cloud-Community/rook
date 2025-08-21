@@ -24,7 +24,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "patch", "update"]
@@ -60,6 +60,12 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
     verbs: ["patch"]
 ---
 # TODO: remove this, once https://github.com/rook/rook/issues/10141

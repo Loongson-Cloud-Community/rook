@@ -26,6 +26,7 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	optest "github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
@@ -45,22 +46,23 @@ func newDeploymentSpecTest(t *testing.T) (*ReconcileCephNFS, daemonConfig) {
 	}
 
 	s := scheme.Scheme
-	object := []runtime.Object{&cephv1.CephNFS{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		TypeMeta: controllerTypeMeta,
-		Spec: cephv1.NFSGaneshaSpec{
-			RADOS: cephv1.GaneshaRADOSSpec{
-				Pool:      "foo",
+	object := []runtime.Object{
+		&cephv1.CephNFS{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
 				Namespace: namespace,
 			},
-			Server: cephv1.GaneshaServerSpec{
-				Active: 1,
+			TypeMeta: controllerTypeMeta,
+			Spec: cephv1.NFSGaneshaSpec{
+				RADOS: cephv1.GaneshaRADOSSpec{
+					Pool:      "foo",
+					Namespace: namespace,
+				},
+				Server: cephv1.GaneshaServerSpec{
+					Active: 1,
+				},
 			},
 		},
-	},
 	}
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
@@ -70,11 +72,11 @@ func newDeploymentSpecTest(t *testing.T) (*ReconcileCephNFS, daemonConfig) {
 		context: c,
 		clusterInfo: &cephclient.ClusterInfo{
 			FSID:        "myfsid",
-			CephVersion: cephver.Quincy,
+			CephVersion: cephver.Squid,
 		},
 		cephClusterSpec: &cephv1.ClusterSpec{
 			CephVersion: cephv1.CephVersionSpec{
-				Image: "quay.io/ceph/ceph:v17",
+				Image: "quay.io/ceph/ceph:v19",
 			},
 		},
 	}
@@ -145,6 +147,7 @@ func TestDeploymentSpec(t *testing.T) {
 			},
 		)
 		assert.Equal(t, "my-priority-class", d.Spec.Template.Spec.PriorityClassName)
+		assert.Equal(t, k8sutil.DefaultServiceAccount, d.Spec.Template.Spec.ServiceAccountName)
 	})
 
 	t.Run("with sssd sidecar", func(t *testing.T) {
@@ -173,7 +176,7 @@ func TestDeploymentSpec(t *testing.T) {
 							Image:      "quay.io/sssd/sssd:latest",
 							DebugLevel: 6,
 							SSSDConfigFile: cephv1.SSSDSidecarConfigFile{
-								VolumeSource: &v1.VolumeSource{
+								VolumeSource: &cephv1.ConfigFileVolumeSource{
 									ConfigMap: &v1.ConfigMapVolumeSource{},
 								},
 							},
@@ -253,12 +256,12 @@ func TestDeploymentSpec(t *testing.T) {
 				Security: &cephv1.NFSSecuritySpec{
 					Kerberos: &cephv1.KerberosSpec{
 						ConfigFiles: cephv1.KerberosConfigFiles{
-							VolumeSource: &v1.VolumeSource{
+							VolumeSource: &cephv1.ConfigFileVolumeSource{
 								ConfigMap: &v1.ConfigMapVolumeSource{},
 							},
 						},
 						KeytabFile: cephv1.KerberosKeytabFile{
-							VolumeSource: &v1.VolumeSource{
+							VolumeSource: &cephv1.ConfigFileVolumeSource{
 								Secret: &v1.SecretVolumeSource{},
 							},
 						},
@@ -330,12 +333,12 @@ func TestDeploymentSpec(t *testing.T) {
 				Security: &cephv1.NFSSecuritySpec{
 					Kerberos: &cephv1.KerberosSpec{
 						ConfigFiles: cephv1.KerberosConfigFiles{
-							VolumeSource: &v1.VolumeSource{
+							VolumeSource: &cephv1.ConfigFileVolumeSource{
 								ConfigMap: &v1.ConfigMapVolumeSource{},
 							},
 						},
 						KeytabFile: cephv1.KerberosKeytabFile{
-							VolumeSource: &v1.VolumeSource{
+							VolumeSource: &cephv1.ConfigFileVolumeSource{
 								Secret: &v1.SecretVolumeSource{},
 							},
 						},
@@ -345,7 +348,7 @@ func TestDeploymentSpec(t *testing.T) {
 							Image:      "quay.io/sssd/sssd:latest",
 							DebugLevel: 6,
 							SSSDConfigFile: cephv1.SSSDSidecarConfigFile{
-								VolumeSource: &v1.VolumeSource{
+								VolumeSource: &cephv1.ConfigFileVolumeSource{
 									ConfigMap: &v1.ConfigMapVolumeSource{},
 								},
 							},
@@ -401,5 +404,56 @@ func TestDeploymentSpec(t *testing.T) {
 			contNames = append(contNames, cont.Name)
 		}
 		assert.Contains(t, contNames, "sssd")
+	})
+
+	t.Run("basic with default liveness-probe", func(t *testing.T) {
+		nfs := &cephv1.CephNFS{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "my-nfs",
+				Namespace: "rook-ceph-test-ns",
+			},
+			Spec: cephv1.NFSGaneshaSpec{
+				RADOS: cephv1.GaneshaRADOSSpec{
+					Pool:      "myfs-data0",
+					Namespace: "nfs-test-ns",
+				},
+				Server: cephv1.GaneshaServerSpec{
+					Active: 3,
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    *resource.NewQuantity(500.0, resource.BinarySI),
+							v1.ResourceMemory: *resource.NewQuantity(1024.0, resource.BinarySI),
+						},
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    *resource.NewQuantity(200.0, resource.BinarySI),
+							v1.ResourceMemory: *resource.NewQuantity(512.0, resource.BinarySI),
+						},
+					},
+					PriorityClassName: "my-priority-class",
+					LivenessProbe: &cephv1.ProbeSpec{
+						Disabled: false,
+					},
+				},
+			},
+		}
+
+		r, cfg := newDeploymentSpecTest(t)
+		d, err := r.makeDeployment(nfs, cfg)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, d.Spec.Template.Annotations)
+
+		// Expects valid settings to default livness-probe
+		var ganeshaCont *v1.Container = nil
+		for i := range d.Spec.Template.Spec.Containers {
+			if d.Spec.Template.Spec.Containers[i].Name == "nfs-ganesha" {
+				ganeshaCont = &d.Spec.Template.Spec.Containers[i]
+				break
+			}
+		}
+		assert.NotNil(t, ganeshaCont)
+		assert.NotNil(t, ganeshaCont.LivenessProbe)
+		assert.Equal(t, ganeshaCont.LivenessProbe.InitialDelaySeconds, int32(10))
+		assert.Equal(t, ganeshaCont.LivenessProbe.FailureThreshold, int32(10))
+		assert.GreaterOrEqual(t, ganeshaCont.LivenessProbe.TimeoutSeconds, int32(5))
 	})
 }

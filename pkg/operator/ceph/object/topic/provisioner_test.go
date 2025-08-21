@@ -23,9 +23,9 @@ import (
 
 	"github.com/coreos/pkg/capnslog"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"github.com/rook/rook/pkg/operator/ceph/version"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -63,16 +63,12 @@ func TestTopicAttributesCreation(t *testing.T) {
 				},
 			},
 		}
-		assert.Equal(t, expectedAttrs, createTopicAttributes(bucketTopic, version.Quincy))
-		// make sure that non quincy version don't use the cloudevents flag
-		bucketTopic.Spec.Endpoint.HTTP.SendCloudEvents = true
-		delete(expectedAttrs, "cloudevents")
-		assert.Equal(t, expectedAttrs, createTopicAttributes(bucketTopic, version.Pacific))
-		// make sure that quincy version can use the cloudevents flag
-		expectedAttrs["cloudevents"] = &trueString
-		assert.Equal(t, expectedAttrs, createTopicAttributes(bucketTopic, version.Quincy))
 
+		attrs, _, err := createTopicAttributes(provisioner{}, bucketTopic)
+		require.NoError(t, err)
+		assert.Equal(t, expectedAttrs, attrs)
 	})
+
 	t.Run("test AMQP attributes", func(t *testing.T) {
 		uri := "amqp://my-rabbitmq-service:5672/vhost1"
 		ackLevel := "broker"
@@ -105,11 +101,16 @@ func TestTopicAttributesCreation(t *testing.T) {
 				},
 			},
 		}
-		assert.Equal(t, expectedAttrs, createTopicAttributes(bucketTopic, version.Quincy))
+
+		attrs, _, err := createTopicAttributes(provisioner{}, bucketTopic)
+		require.NoError(t, err)
+		assert.Equal(t, expectedAttrs, attrs)
 	})
+
 	t.Run("test Kafka attributes", func(t *testing.T) {
 		uri := "kafka://my-kafka-service:9092"
 		ackLevel := "broker"
+		mechanism := "SCRAM-SHA-512"
 		expectedAttrs := map[string]*string{
 			"OpaqueData":      &emptyString,
 			"persistent":      &falseString,
@@ -117,6 +118,7 @@ func TestTopicAttributesCreation(t *testing.T) {
 			"verify-ssl":      &trueString,
 			"kafka-ack-level": &ackLevel,
 			"use-ssl":         &trueString,
+			"mechanism":       &mechanism,
 		}
 		bucketTopic := &cephv1.CephBucketTopic{
 			ObjectMeta: metav1.ObjectMeta{
@@ -131,13 +133,17 @@ func TestTopicAttributesCreation(t *testing.T) {
 				ObjectStoreNamespace: namespace,
 				Endpoint: cephv1.TopicEndpointSpec{
 					Kafka: &cephv1.KafkaEndpointSpec{
-						URI:      uri,
-						AckLevel: ackLevel,
-						UseSSL:   true,
+						URI:       uri,
+						AckLevel:  ackLevel,
+						UseSSL:    true,
+						Mechanism: mechanism,
 					},
 				},
 			},
 		}
-		assert.Equal(t, expectedAttrs, createTopicAttributes(bucketTopic, version.Quincy))
+
+		attrs, _, err := createTopicAttributes(provisioner{}, bucketTopic)
+		require.NoError(t, err)
+		assert.Equal(t, expectedAttrs, attrs)
 	})
 }

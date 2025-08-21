@@ -14,6 +14,7 @@ metadata:
   name: rook-ceph
   namespace: rook-ceph # namespace:cluster
 spec:
+  # If there are multiple clusters, the directory must be unique for each cluster.
   dataDirHostPath: /var/lib/rook
   mon:
     # Five mons must be created for stretch mode
@@ -25,11 +26,11 @@ spec:
       # https://rook.io/docs/rook/latest/CRDs/ceph-cluster-crd/#osd-topology.
       failureDomainLabel: topology.kubernetes.io/zone
       # The sub failure domain is the secondary level at which the data will be placed to maintain data durability and availability.
-      # The default is "host", which means that each OSD must be on a different node and you would need at least two nodes per zone.
-      # If the subFailureDomain is set to "osd", the OSDs would be allowed anywhere in the same zone including on the same node.
+      # Since OSDs are portable, the default is "osd", which means that you would need at least two nodes per zone.
+      # If the subFailureDomain is set to "host", the OSDs should not be portable.
       # If set to "rack" or some other intermediate failure domain, those labels would also need to be set on the nodes where
       # the osds are started.
-      subFailureDomain: host
+      subFailureDomain: osd
       zones:
         - name: us-east-2a
           arbiter: true
@@ -37,15 +38,14 @@ spec:
         - name: us-east-2c
     volumeClaimTemplate:
       spec:
-        storageClassName: gp2
+        storageClassName: gp2-csi
         resources:
           requests:
             storage: 10Gi
   mgr:
     count: 2
   cephVersion:
-    # Stretch cluster support upstream is only available starting in Ceph Pacific
-    image: quay.io/ceph/ceph:v17.2.5
+    image: quay.io/ceph/ceph:v19.2.3
     allowUnsupported: true
   skipUpgradeChecks: false
   continueUpgradeAfterChecksEvenIfNotHealthy: false
@@ -86,7 +86,7 @@ spec:
               resources:
                 requests:
                   storage: 10Gi
-              storageClassName: gp2
+              storageClassName: gp2-csi
               volumeMode: Block
               accessModes:
                 - ReadWriteOnce
@@ -119,7 +119,7 @@ spec:
               resources:
                 requests:
                   storage: 10Gi
-              storageClassName: gp2
+              storageClassName: gp2-csi
               volumeMode: Block
               accessModes:
                 - ReadWriteOnce
@@ -141,3 +141,17 @@ spec:
     mgr: system-cluster-critical
   disruptionManagement:
     managePodBudgets: true
+---
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: builtin-mgr
+  namespace: rook-ceph # namespace:cluster
+spec:
+  name: .mgr
+  failureDomain: zone
+  replicated:
+    size: 4
+    requireSafeReplicaSize: true
+    replicasPerFailureDomain: 2
+    subFailureDomain: osd

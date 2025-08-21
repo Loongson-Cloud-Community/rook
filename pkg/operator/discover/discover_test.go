@@ -19,6 +19,7 @@ package discover
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
@@ -79,10 +80,35 @@ func TestStartDiscoveryDaemonset(t *testing.T) {
 	volumeMounts := agentDS.Spec.Template.Spec.Containers[0].VolumeMounts
 	assert.Equal(t, 3, len(volumeMounts))
 	envs := agentDS.Spec.Template.Spec.Containers[0].Env
-	assert.Equal(t, 3, len(envs))
+	assert.Equal(t, 4, len(envs))
 	image := agentDS.Spec.Template.Spec.Containers[0].Image
 	assert.Equal(t, "rook/rook:myversion", image)
 	assert.Nil(t, agentDS.Spec.Template.Spec.Tolerations)
+
+	// Test with rook override configmap setting
+	os.Setenv("DISCOVER_TOLERATIONS", "- effect: NoSchedule\n  key: node-role.kubernetes.io/control-plane\n  operator: Exists\n- effect: NoExecute\n  key: node-role.kubernetes.io/etcd\n  operator: Exists")
+	defer os.Unsetenv("DISCOVER_TOLERATIONS")
+
+	// start a basic cluster
+	err = a.Start(ctx, namespace, "rook/rook:myversion", "mysa", false)
+	assert.Nil(t, err)
+
+	agentDS, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, "rook-discover", metav1.GetOptions{})
+	assert.NoError(t, err)
+
+	want := []v1.Toleration{
+		{
+			Key:      "node-role.kubernetes.io/control-plane",
+			Operator: v1.TolerationOpExists,
+			Effect:   v1.TaintEffectNoSchedule,
+		},
+		{
+			Key:      "node-role.kubernetes.io/etcd",
+			Operator: v1.TolerationOpExists,
+			Effect:   v1.TaintEffectNoExecute,
+		},
+	}
+	assert.Equal(t, want, agentDS.Spec.Template.Spec.Tolerations)
 }
 
 func TestGetAvailableDevices(t *testing.T) {

@@ -39,19 +39,20 @@ type TestCephSettings struct {
 	MultipleMgrs                bool
 	SkipOSDCreation             bool
 	EnableDiscovery             bool
-	EnableAdmissionController   bool
 	IsExternal                  bool
 	SkipClusterCleanup          bool
 	SkipCleanupPolicy           bool
 	DirectMountToolbox          bool
 	ConnectionsEncrypted        bool
 	ConnectionsCompressed       bool
+	RequireMsgr2                bool
 	EnableVolumeReplication     bool
 	TestNFSCSI                  bool
 	ChangeHostName              bool
 	RookVersion                 string
 	CephVersion                 cephv1.CephVersionSpec
 	KubernetesVersion           string
+	EnableCsiOperator           bool
 }
 
 func (s *TestCephSettings) ApplyEnvVars() {
@@ -63,10 +64,6 @@ func (s *TestCephSettings) ApplyEnvVars() {
 	s.SkipCleanupPolicy = true
 	if os.Getenv("SKIP_CLEANUP_POLICY") == "false" {
 		s.SkipCleanupPolicy = false
-	}
-	err := os.Setenv("ROOK_DISABLE_ADMISSION_CONTROLLER", "false")
-	if err != nil {
-		logger.Errorf("failed to set ROOK_DISABLE_ADMISSION_CONTROLLER. %v", err)
 	}
 }
 
@@ -84,12 +81,23 @@ func (s *TestCephSettings) readManifestFromGitHubWithClusterNamespace(filename, 
 	return replaceNamespaces(filename, manifest, s.OperatorNamespace, clusterNamespace)
 }
 
+func (s *TestCephSettings) replaceCSIOperatorSettings(csiNamespace, manifest string) string {
+	manifest = strings.ReplaceAll(manifest, `namespace: rook-ceph`, `namespace: `+csiNamespace)
+	return manifest
+}
+
 func (s *TestCephSettings) replaceOperatorSettings(manifest string) string {
 	manifest = strings.ReplaceAll(manifest, `ROOK_LOG_LEVEL: "INFO"`, `ROOK_LOG_LEVEL: "DEBUG"`)
 	manifest = strings.ReplaceAll(manifest, `# CSI_LOG_LEVEL: "0"`, `CSI_LOG_LEVEL: "5"`)
 	manifest = strings.ReplaceAll(manifest, `ROOK_ENABLE_DISCOVERY_DAEMON: "false"`, fmt.Sprintf(`ROOK_ENABLE_DISCOVERY_DAEMON: "%t"`, s.EnableDiscovery))
 	manifest = strings.ReplaceAll(manifest, `CSI_ENABLE_VOLUME_REPLICATION: "false"`, fmt.Sprintf(`CSI_ENABLE_VOLUME_REPLICATION: "%t"`, s.EnableVolumeReplication))
 	manifest = strings.ReplaceAll(manifest, `ROOK_CSI_ENABLE_NFS: "false"`, fmt.Sprintf(`ROOK_CSI_ENABLE_NFS: "%t"`, s.TestNFSCSI))
+	manifest = strings.ReplaceAll(manifest,
+		`# ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS: "maxObjects,maxSize" # default allowed configs`,
+		`ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS: "maxObjects,maxSize,bucketMaxObjects,bucketMaxSize,bucketPolicy,bucketLifecycle,bucketOwner"`)
+	if !s.EnableCsiOperator {
+		manifest = strings.ReplaceAll(manifest, `ROOK_USE_CSI_OPERATOR: "true"`, `ROOK_USE_CSI_OPERATOR: "false"`)
+	}
 	return manifest
 }
 
@@ -103,6 +111,7 @@ func replaceNamespaces(name, manifest, operatorNamespace, clusterNamespace strin
 
 	// SCC namespaces for operator and Ceph daemons
 	manifest = strings.ReplaceAll(manifest, "rook-ceph:rook-ceph-system # serviceaccount:namespace:operator", operatorNamespace+":rook-ceph-system")
+	manifest = strings.ReplaceAll(manifest, "rook-ceph:rook-ceph-default # serviceaccount:namespace:cluster", clusterNamespace+":rook-ceph-default")
 	manifest = strings.ReplaceAll(manifest, "rook-ceph:rook-ceph-mgr # serviceaccount:namespace:cluster", clusterNamespace+":rook-ceph-mgr")
 	manifest = strings.ReplaceAll(manifest, "rook-ceph:rook-ceph-osd # serviceaccount:namespace:cluster", clusterNamespace+":rook-ceph-osd")
 	manifest = strings.ReplaceAll(manifest, "rook-ceph:rook-ceph-rgw # serviceaccount:namespace:cluster", clusterNamespace+":rook-ceph-rgw")
@@ -114,8 +123,8 @@ func replaceNamespaces(name, manifest, operatorNamespace, clusterNamespace strin
 	manifest = strings.ReplaceAll(manifest, "rook-ceph:rook-csi-cephfs-provisioner-sa # serviceaccount:namespace:operator", operatorNamespace+":rook-csi-cephfs-provisioner-sa")
 
 	// CSI Drivers
-	manifest = strings.ReplaceAll(manifest, "rook-ceph.cephfs.csi.ceph.com # driver:namespace:operator", operatorNamespace+".cephfs.csi.ceph.com")
-	manifest = strings.ReplaceAll(manifest, "rook-ceph.rbd.csi.ceph.com # driver:namespace:operator", operatorNamespace+".rbd.csi.ceph.com")
+	manifest = strings.ReplaceAll(manifest, "rook-ceph.cephfs.csi.ceph.com # csi-provisioner-name", operatorNamespace+".cephfs.csi.ceph.com")
+	manifest = strings.ReplaceAll(manifest, "rook-ceph.rbd.csi.ceph.com # csi-provisioner-name", operatorNamespace+".rbd.csi.ceph.com")
 
 	// Bucket storage class
 	manifest = strings.ReplaceAll(manifest, "rook-ceph.ceph.rook.io/bucket # driver:namespace:cluster", clusterNamespace+".ceph.rook.io/bucket")

@@ -18,8 +18,9 @@ package nfs
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
-	"io/ioutil"
+	"os"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -88,7 +89,8 @@ func (r *ReconcileCephNFS) generateKeyring(n *cephv1.CephNFS, name string) error
 	}
 
 	keyring := fmt.Sprintf(keyringTemplate, user, key, osdCaps)
-	return s.CreateOrUpdate(instanceName(n, name), keyring)
+	_, err = s.CreateOrUpdate(instanceName(n, name), keyring)
+	return err
 }
 
 func getGaneshaConfig(n *cephv1.CephNFS, version cephver.CephVersion, name string) string {
@@ -100,6 +102,7 @@ NFS_CORE_PARAM {
 	Enable_NLM = false;
 	Enable_RQUOTA = false;
 	Protocols = 4;
+	allow_set_io_flusher_fail = true;
 }
 
 MDCACHE {
@@ -112,12 +115,12 @@ EXPORT_DEFAULTS {
 
 NFSv4 {
 	Delegations = false;
-	RecoveryBackend = 'rados_cluster';
+	RecoveryBackend = "rados_cluster";
 	Minor_Versions = 1, 2;
 }
 
 RADOS_KV {
-	ceph_conf = '` + cephclient.DefaultConfigFilePath() + `';
+	ceph_conf = "` + cephclient.DefaultConfigFilePath() + `";
 	userid = ` + userID + `;
 	nodeid = ` + nodeID + `;
 	pool = "` + n.Spec.RADOS.Pool + `";
@@ -125,9 +128,13 @@ RADOS_KV {
 }
 
 RADOS_URLS {
-	ceph_conf = '` + cephclient.DefaultConfigFilePath() + `';
+	ceph_conf = "` + cephclient.DefaultConfigFilePath() + `";
 	userid = ` + userID + `;
-	watch_url = '` + url + `';
+	watch_url = "` + url + `";
+}
+
+RGW {
+	name = "client.` + userID + `";
 }
 
 %url	` + url + `
@@ -163,7 +170,7 @@ func setKerberosRadosConfig(context *clusterd.Context, clusterInfo *cephclient.C
 	logger.Infof("ensuring kerberos configuration exists in rados namespace %s", radosInfoStr)
 
 	// write ganesha kerberos configuration block into a temp file
-	krbBlockFile, err := ioutil.TempFile("", "krb-block-file")
+	krbBlockFile, err := os.CreateTemp("", "krb-block-file")
 	if err != nil {
 		return errors.Wrapf(err, "failed to create temp file for ganesha kerberos configuration block for %s", radosInfoStr)
 	}
@@ -233,82 +240,7 @@ func atomicPrependToConfigObject(
 	objInfoString := fmt.Sprintf("rados://%s/%s/%s", radosPool, radosNamespace, objectName)
 
 	// read object into temp file
-	tempFile, err := ioutil.TempFile("", tmpFilePattern)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create temp file for %s", objInfoString)
-	}
-	defer tempFile.Close()
-
-	radosFlags := []string{
-		"--pool", radosPool,
-		"--namespace", radosNamespace,
-	}
-
-	// acquire lock to ensure no other processes (user, ceph, or rook) are racing each other
-	// most common contender will be CSI when creating/removing NFS exports
-	lockName := AppName
-
-	// planning to perform 2 commands after the lock: get object, and optionally write object, so
-	// use lock timeout of 2x the normal ceph command timeout
-	logger.Infof("locking rados object %q", objInfoString)
-	cookie, err := cephclient.RadosLockObject(context, clusterInfo,
-		radosPool, radosNamespace, objectName, lockName, exec.CephCommandsTimeout*2)
-	if err != nil {
-		return err // already a good err message
-	}
-	logger.Infof("successfully locked rados object %q", objInfoString)
-	defer func() {
-		logger.Infof("unlocking rados object %q", objInfoString)
-		err := cephclient.RadosUnlockObject(context, clusterInfo,
-			radosPool, radosNamespace, objectName, lockName, cookie)
-		if err != nil {
-			logger.Infof("failed to unlock rados object %q, but since the lock has a timeout, we will continue. %v", objInfoString, err)
-		}
-		logger.Info("successfully unlocked rados object %q", objInfoString)
-	}()
-
-	cmd := cephclient.NewRadosCommand(context, clusterInfo,
-		append(radosFlags, "get", objectName, tempFile.Name()))
-	if _, err := cmd.RunWithTimeout(exec.CephCommandsTimeout); err != nil {
-		return errors.Wrapf(err, "failed to get object %s", objInfoString)
-	}
-
-	rawObj, err := ioutil.ReadAll(tempFile)
-	if err != nil {
-		return errors.Wrapf(err, "failed to read object %s from temp file", objInfoString)
-	}
-
-	if strings.Contains(string(rawObj), configBlock) {
-		logger.Debugf("rados object %s already has config block: %s", objInfoString, configBlock)
-		return nil
-	}
-	logger.Debugf("rados object %s will have config block prepended: %s", objInfoString, configBlock)
-
-	newConfig := fmt.Sprintf("%s%s", configBlock, string(rawObj))
-	if err := ioutil.WriteFile(tempFile.Name(), []byte(newConfig), fs.FileMode(0644)); err != nil {
-		return errors.Wrapf(err, "failed to write new config content for object %s to temp file", objInfoString)
-	}
-
-	cmd = cephclient.NewRadosCommand(context, clusterInfo,
-		append(radosFlags, "put", objectName, tempFile.Name()))
-	if _, err := cmd.RunWithTimeout(exec.CephCommandsTimeout); err != nil {
-		return errors.Wrapf(err, "failed to set new config content on object %s", objInfoString)
-	}
-
-	return nil
-}
-
-// remove a config block from the rados object in an atomic function
-// uses rados locks to ensure the changes we make here aren't going to race with changes that might
-// be made by ceph mgr, ceph itself, or a user manually
-func atomicRemoveFromConfigObject(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo,
-	radosPool, radosNamespace, objectName, configBlock string,
-) error {
-	tmpFilePattern := fmt.Sprintf("%s_%s_%s_remove", radosPool, radosNamespace, objectName)
-	objInfoString := fmt.Sprintf("rados://%s/%s/%s", radosPool, radosNamespace, objectName)
-
-	// read object into temp file
-	tempFile, err := ioutil.TempFile("", tmpFilePattern)
+	tempFile, err := os.CreateTemp("", tmpFilePattern)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create temp file for %s", objInfoString)
 	}
@@ -348,7 +280,82 @@ func atomicRemoveFromConfigObject(context *clusterd.Context, clusterInfo *cephcl
 		return errors.Wrapf(err, "failed to get object %s", objInfoString)
 	}
 
-	rawObj, err := ioutil.ReadAll(tempFile)
+	rawObj, err := io.ReadAll(tempFile)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read object %s from temp file", objInfoString)
+	}
+
+	if strings.Contains(string(rawObj), configBlock) {
+		logger.Debugf("rados object %s already has config block: %s", objInfoString, configBlock)
+		return nil
+	}
+	logger.Debugf("rados object %s will have config block prepended: %s", objInfoString, configBlock)
+
+	newConfig := fmt.Sprintf("%s%s", configBlock, string(rawObj))
+	if err := os.WriteFile(tempFile.Name(), []byte(newConfig), fs.FileMode(0o644)); err != nil {
+		return errors.Wrapf(err, "failed to write new config content for object %s to temp file", objInfoString)
+	}
+
+	cmd = cephclient.NewRadosCommand(context, clusterInfo,
+		append(radosFlags, "put", objectName, tempFile.Name()))
+	if _, err := cmd.RunWithTimeout(exec.CephCommandsTimeout); err != nil {
+		return errors.Wrapf(err, "failed to set new config content on object %s", objInfoString)
+	}
+
+	return nil
+}
+
+// remove a config block from the rados object in an atomic function
+// uses rados locks to ensure the changes we make here aren't going to race with changes that might
+// be made by ceph mgr, ceph itself, or a user manually
+func atomicRemoveFromConfigObject(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo,
+	radosPool, radosNamespace, objectName, configBlock string,
+) error {
+	tmpFilePattern := fmt.Sprintf("%s_%s_%s_remove", radosPool, radosNamespace, objectName)
+	objInfoString := fmt.Sprintf("rados://%s/%s/%s", radosPool, radosNamespace, objectName)
+
+	// read object into temp file
+	tempFile, err := os.CreateTemp("", tmpFilePattern)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create temp file for %s", objInfoString)
+	}
+	defer tempFile.Close()
+
+	radosFlags := []string{
+		"--pool", radosPool,
+		"--namespace", radosNamespace,
+	}
+
+	// acquire lock to ensure no other processes (user, ceph, or rook) are racing each other
+	// most common contender will be CSI when creating/removing NFS exports
+	lockName := AppName
+
+	// planning to perform 2 commands after the lock: get object, and optionally write object, so
+	// use lock timeout of 2x the normal ceph command timeout
+	logger.Infof("locking rados object %q", objInfoString)
+	cookie, err := cephclient.RadosLockObject(context, clusterInfo,
+		radosPool, radosNamespace, objectName, lockName, exec.CephCommandsTimeout*2)
+	if err != nil {
+		return err // already a good err message
+	}
+	logger.Infof("successfully locked rados object %q", objInfoString)
+	defer func() {
+		logger.Infof("unlocking rados object %q", objInfoString)
+		err := cephclient.RadosUnlockObject(context, clusterInfo,
+			radosPool, radosNamespace, objectName, lockName, cookie)
+		if err != nil {
+			logger.Infof("failed to unlock rados object %q, but since the lock has a timeout, we will continue. %v", objInfoString, err)
+		}
+		logger.Infof("successfully unlocked rados object %q", objInfoString)
+	}()
+
+	cmd := cephclient.NewRadosCommand(context, clusterInfo,
+		append(radosFlags, "get", objectName, tempFile.Name()))
+	if _, err := cmd.RunWithTimeout(exec.CephCommandsTimeout); err != nil {
+		return errors.Wrapf(err, "failed to get object %s", objInfoString)
+	}
+
+	rawObj, err := io.ReadAll(tempFile)
 	if err != nil {
 		return errors.Wrapf(err, "failed to read object %s from temp file", objInfoString)
 	}
@@ -360,7 +367,7 @@ func atomicRemoveFromConfigObject(context *clusterd.Context, clusterInfo *cephcl
 	logger.Debugf("rados object %s will have config block removed: %s", objInfoString, configBlock)
 
 	newConfig := strings.ReplaceAll(string(rawObj), configBlock, "")
-	if err := ioutil.WriteFile(tempFile.Name(), []byte(newConfig), fs.FileMode(0644)); err != nil {
+	if err := os.WriteFile(tempFile.Name(), []byte(newConfig), fs.FileMode(0o644)); err != nil {
 		return errors.Wrapf(err, "failed to write new config content for object %s to temp file", objInfoString)
 	}
 

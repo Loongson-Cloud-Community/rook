@@ -17,9 +17,12 @@ limitations under the License.
 package client
 
 import (
+	ctx "context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -96,8 +99,10 @@ func ListFilesystems(context *clusterd.Context, clusterInfo *ClusterInfo) ([]Cep
 	return filesystems, nil
 }
 
-// GetFilesystem gets detailed status information about a Ceph filesystem.
-func GetFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string) (*CephFilesystemDetails, error) {
+var GetFilesystem = getFilesystem
+
+// getFilesystem gets detailed status information about a Ceph filesystem.
+func getFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string) (*CephFilesystemDetails, error) {
 	args := []string{"fs", "get", fsName}
 	buf, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
@@ -115,7 +120,7 @@ func GetFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, fsName s
 
 // AllowStandbyReplay gets detailed status information about a Ceph filesystem.
 func AllowStandbyReplay(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string, allowStandbyReplay bool) error {
-	logger.Infof("setting allow_standby_replay for filesystem %q", fsName)
+	logger.Infof("setting allow_standby_replay to %t for filesystem %q", allowStandbyReplay, fsName)
 	args := []string{"fs", "set", fsName, "allow_standby_replay", strconv.FormatBool(allowStandbyReplay)}
 	_, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
@@ -165,6 +170,14 @@ func AddDataPoolToFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo
 	args := []string{"fs", "add_data_pool", name, poolName}
 	_, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
+		// Reef disallows calling add_data_pool for a pool that has already
+		// been added, so ignore the error code.
+		// Previous releases do not return an error when an existing data pool is added.
+		if clusterInfo.CephVersion.IsAtLeastReef() {
+			if code, ok := exec.ExitStatus(err); ok && code == int(syscall.EINVAL) {
+				return nil
+			}
+		}
 		return errors.Wrapf(err, "failed to add pool %q to file system %q. (%v)", poolName, name, err)
 	}
 	return nil
@@ -172,7 +185,6 @@ func AddDataPoolToFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo
 
 // SetNumMDSRanks sets the number of mds ranks (max_mds) for a Ceph filesystem.
 func SetNumMDSRanks(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string, activeMDSCount int32) error {
-
 	// Always tell Ceph to set the new max_mds value
 	args := []string{"fs", "set", fsName, "max_mds", strconv.Itoa(int(activeMDSCount))}
 	if _, err := NewCephCommand(context, clusterInfo, args).Run(); err != nil {
@@ -183,7 +195,7 @@ func SetNumMDSRanks(context *clusterd.Context, clusterInfo *ClusterInfo, fsName 
 
 // FailAllStandbyReplayMDS: fail all mds in up:standby-replay state
 func FailAllStandbyReplayMDS(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string) error {
-	fs, err := GetFilesystem(context, clusterInfo, fsName)
+	fs, err := getFilesystem(context, clusterInfo, fsName)
 	if err != nil {
 		return errors.Wrapf(err, "failed to fail standby-replay MDSes for fs %q", fsName)
 	}
@@ -199,7 +211,7 @@ func FailAllStandbyReplayMDS(context *clusterd.Context, clusterInfo *ClusterInfo
 
 // GetMdsIdByRank get mds ID from the given rank
 func GetMdsIdByRank(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string, rank int32) (string, error) {
-	fs, err := GetFilesystem(context, clusterInfo, fsName)
+	fs, err := getFilesystem(context, clusterInfo, fsName)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to get ceph fs dump")
 	}
@@ -229,8 +241,8 @@ func WaitForActiveRanks(
 	}
 	logger.Infof("waiting %.2f second(s) for number of active mds daemons for fs %s to become %s",
 		float64(timeout/time.Second), fsName, countText)
-	err := wait.Poll(3*time.Second, timeout, func() (bool, error) {
-		fs, err := GetFilesystem(context, clusterInfo, fsName)
+	err := wait.PollUntilContextTimeout(clusterInfo.Context, 3*time.Second, timeout, true, func(ctx ctx.Context) (bool, error) {
+		fs, err := getFilesystem(context, clusterInfo, fsName)
 		if err != nil {
 			logger.Errorf(
 				"Error getting filesystem %q details while waiting for num mds ranks to become %d. %v",
@@ -295,7 +307,7 @@ func FailFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, fsName 
 // RemoveFilesystem performs software configuration steps to remove a Ceph filesystem and its
 // backing pools.
 func RemoveFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string, preservePoolsOnDelete bool) error {
-	fs, err := GetFilesystem(context, clusterInfo, fsName)
+	fs, err := getFilesystem(context, clusterInfo, fsName)
 	if err != nil {
 		return errors.Wrapf(err, "filesystem %s not found", fsName)
 	}
@@ -350,20 +362,34 @@ func deleteFSPool(context *clusterd.Context, clusterInfo *ClusterInfo, poolNames
 }
 
 // WaitForNoStandbys waits for all standbys go away
-func WaitForNoStandbys(context *clusterd.Context, clusterInfo *ClusterInfo, timeout time.Duration) error {
-	err := wait.Poll(3*time.Second, timeout, func() (bool, error) {
+func WaitForNoStandbys(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string, retryInterval, timeout time.Duration) error {
+	err := wait.PollUntilContextTimeout(clusterInfo.Context, retryInterval, timeout, true, func(ctx ctx.Context) (bool, error) {
 		mdsDump, err := GetMDSDump(context, clusterInfo)
 		if err != nil {
 			logger.Errorf("failed to get fs dump. %v", err)
 			return false, nil
 		}
-		return len(mdsDump.Standbys) == 0, nil
+		return !filesystemHasStandby(mdsDump, fsName), nil
 	})
-
 	if err != nil {
 		return errors.Wrap(err, "timeout waiting for no standbys")
 	}
 	return nil
+}
+
+func filesystemHasStandby(dump *MDSDump, fsName string) bool {
+	for _, standby := range dump.Standbys {
+		// The mds dump does not explicitly return the name of the filesystem that the
+		// daemon belongs to, so the matching to the filesystem name is based on the mds daemon name
+		// with a regular expression comparison with the expected suffix.
+		// For example, if the filesystem is "myfs", the standby name may be "myfs-a" or "myfs-b".
+		matchString := fmt.Sprintf("^%s-[a-z]{1}$", fsName)
+		matched, _ := regexp.MatchString(matchString, standby.Name)
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func GetMDSDump(context *clusterd.Context, clusterInfo *ClusterInfo) (*MDSDump, error) {
@@ -423,7 +449,7 @@ type SubvolumeList []Subvolume
 const NoSubvolumeGroup = ""
 
 // ListSubvolumesInGroup lists all subvolumes present in the given filesystem's subvolume group by
-// name. If groupName is empty, list subvolumes that are not in any group. Times out after 5 seconds.
+// name. If groupName is empty, list subvolumes that are not in any group.
 var ListSubvolumesInGroup = listSubvolumesInGroup
 
 // with above, allow this to be overridden for unit testing
@@ -441,10 +467,61 @@ func listSubvolumesInGroup(context *clusterd.Context, clusterInfo *ClusterInfo, 
 	if err != nil {
 		return svs, errors.Wrapf(err, "failed to list subvolumes in filesystem %q subvolume group %q", fsName, groupName)
 	}
-
 	if err := json.Unmarshal(buf, &svs); err != nil {
 		return svs, errors.Wrapf(err, "failed to unmarshal subvolume list for filesystem %q subvolume group %q", fsName, groupName)
 	}
+	return svs, nil
+}
+
+// SubVolumeSnapshot represents snapshot of a cephFS subvolume
+type SubVolumeSnapshot struct {
+	Name string `json:"name"`
+}
+
+// SubVolumeSnapshots is the list of snapshots in a CephFS subvolume
+type SubVolumeSnapshots []SubVolumeSnapshot
+
+// ListSubVolumeSnaphots lists all the subvolume snapshots present in the subvolume in the given filesystem's subvolume group.
+var ListSubVolumeSnapshots = listSubVolumeSnapshots
+
+func listSubVolumeSnapshots(context *clusterd.Context, clusterInfo *ClusterInfo, fsName, subVolumeName, groupName string) (SubVolumeSnapshots, error) {
+	svs := SubVolumeSnapshots{}
+	args := []string{"fs", "subvolume", "snapshot", "ls", fsName, subVolumeName, "--group_name", groupName}
+	cmd := NewCephCommand(context, clusterInfo, args)
+	buf, err := cmd.RunWithTimeout(exec.CephCommandsTimeout)
+	if err != nil {
+		return svs, errors.Wrapf(err, "failed to list subvolumes in filesystem %q subvolume group %q", fsName, groupName)
+	}
+
+	if err := json.Unmarshal(buf, &svs); err != nil {
+		return svs, errors.Wrapf(err, "failed to unmarshal snapshots for subvolume %q for filesystem %q subvolume group %q", subVolumeName, fsName, groupName)
+	}
 
 	return svs, nil
+}
+
+// SubVolumeSnapshotPendingClones refers to all the pending clones available in a cephFS subvolume snapshot
+type SubVolumeSnapshotPendingClones struct {
+	Clones []struct {
+		Name string `json:"name"`
+	} `json:"pending_clones"`
+}
+
+var ListSubVolumeSnapshotPendingClones = listSubVolumeSnapshotPendingClones
+
+// listSubVolumeSnapshotPendingClones lists all the pending clones available in a cephFS subvolume snapshot
+func listSubVolumeSnapshotPendingClones(context *clusterd.Context, clusterInfo *ClusterInfo, fsName, subVolumeName, snap, groupName string) (SubVolumeSnapshotPendingClones, error) {
+	pendingClones := SubVolumeSnapshotPendingClones{}
+	args := []string{"fs", "subvolume", "snapshot", "info", fsName, subVolumeName, snap, "--group_name", groupName}
+	cmd := NewCephCommand(context, clusterInfo, args)
+	buf, err := cmd.RunWithTimeout(exec.CephCommandsTimeout)
+	if err != nil {
+		return pendingClones, errors.Wrapf(err, "failed to list pending clones available for snapshot %q in filesystem %q in subvolume group %q", snap, fsName, groupName)
+	}
+
+	if err := json.Unmarshal(buf, &pendingClones); err != nil {
+		return pendingClones, errors.Wrapf(err, "failed to unmarshal pending clones list for for snapshot %q in filesystem %q subvolume group %q", snap, fsName, groupName)
+	}
+
+	return pendingClones, nil
 }

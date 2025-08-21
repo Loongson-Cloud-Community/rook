@@ -19,7 +19,6 @@ package util
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,10 +31,10 @@ var logger = capnslog.NewPackageLogger("github.com/rook/rook", "util")
 
 func WriteFile(filePath string, contentBuffer bytes.Buffer) error {
 	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0744); err != nil {
+	if err := os.MkdirAll(dir, 0o744); err != nil {
 		return fmt.Errorf("failed to create config file directory at %s: %+v", dir, err)
 	}
-	if err := ioutil.WriteFile(filePath, contentBuffer.Bytes(), 0600); err != nil {
+	if err := os.WriteFile(filePath, contentBuffer.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("failed to write config file to %s: %+v", filePath, err)
 	}
 
@@ -43,7 +42,7 @@ func WriteFile(filePath string, contentBuffer bytes.Buffer) error {
 }
 
 func WriteFileToLog(logger *capnslog.PackageLogger, path string) {
-	contents, err := ioutil.ReadFile(filepath.Clean(path))
+	contents, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		logger.Warningf("failed to write file %s to log: %+v", path, err)
 		return
@@ -65,13 +64,13 @@ func PathToProjectRoot() string {
 // CreateTempFile creates a temporary file with content passed as an argument
 func CreateTempFile(content string) (*os.File, error) {
 	// Generate a temp file
-	file, err := ioutil.TempFile("", "")
+	file, err := os.CreateTemp("", "")
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to generate temp file")
 	}
 
 	// Write content into file
-	err = ioutil.WriteFile(file.Name(), []byte(content), 0440)
+	err = os.WriteFile(file.Name(), []byte(content), 0o400)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to write content into file")
 	}
